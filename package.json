@@ -1,0 +1,30 @@
+{
+  "name": "jira-mcp",
+  "version": "1.1.0",
+  "description": "JIRA MCP Integration for Claude",
+  "type": "module",
+  "bin": {
+    "jira-mcp": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod 755 build/index.js",
+    "build-win": "tsc"
+  },
+  "files": [
+    "build"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.7.0",
+    "@types/jsonwebtoken": "^9.0.9",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.4.7",
+    "jsonwebtoken": "^9.0.2",
+    "node-fetch": "^3.3.2",
+    "tsc": "^2.0.4",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "typescript": "^5.9.3"
+  }
+}
