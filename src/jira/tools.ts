@@ -157,12 +157,9 @@ export function registerJiraTools(server: McpServer) {
         payload.fields.labels = ["QA-Testable"];
       }
 
-      // Add parent epic if provided
+      // Add parent if provided (Jira hierarchy: Story under Epic, Task under Epic, etc.)
       if (parent_epic !== undefined) {
-        // Using environment variable for epic link field
-        const epicLinkField =
-          process.env.JIRA_EPIC_LINK_FIELD || "customfield_10014";
-        payload.fields[epicLinkField] = parent_epic;
+        payload.fields.parent = { key: parent_epic };
       }
 
       // Add sprint if provided
