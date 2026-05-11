@@ -8,23 +8,23 @@ const __dirname = path.dirname(__filename);
 
 // Load .env from the project root (parent of src or build directory)
 const envPath = path.resolve(__dirname, "..", ".env");
-console.error(`[JIRA-MCP] Loading .env from: ${envPath}`);
 const result = dotenv.config({ path: envPath });
 if (result.error) {
   console.error(`[JIRA-MCP] Error loading .env:`, result.error);
-} else {
-  console.error(`[JIRA-MCP] .env loaded successfully`);
 }
-console.error(`[JIRA-MCP] JIRA_HOST: ${process.env.JIRA_HOST || 'NOT SET'}`);
-console.error(`[JIRA-MCP] JIRA_USERNAME: ${process.env.JIRA_USERNAME ? 'SET' : 'NOT SET'}`);
-console.error(`[JIRA-MCP] JIRA_API_TOKEN: ${process.env.JIRA_API_TOKEN ? 'SET' : 'NOT SET'}`);
+if (process.env.DEBUG === "true") {
+  console.error(`[JIRA-MCP] Loading .env from: ${envPath}`);
+  console.error(`[JIRA-MCP] JIRA_HOST: ${process.env.JIRA_HOST || 'NOT SET'}`);
+  console.error(`[JIRA-MCP] JIRA_USERNAME: ${process.env.JIRA_USERNAME ? 'SET' : 'NOT SET'}`);
+  console.error(`[JIRA-MCP] JIRA_API_TOKEN: ${process.env.JIRA_API_TOKEN ? 'SET' : 'NOT SET'}`);
+}
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import fetch from "node-fetch";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
+import { fetchWithRetry } from "./http.js";
 import { updateJiraTicket } from "./update-ticket.js";
 import { getZephyrTestSteps } from "./get-zephyr-test-steps.js";
 
@@ -150,35 +150,28 @@ async function addZephyrTestStep(
   data?: ZephyrAddTestStepResponse;
   errorMessage?: string;
 }> {
-  // Zephyr base URL from environment variable
   const baseUrl =
     process.env.ZAPI_BASE_URL ||
     "https://prod-api.zephyr4jiracloud.com/connect";
-  // Use the correct API endpoint format for Zephyr Squad Cloud
   const apiPath = `/public/rest/api/1.0/teststep/${issueId}`;
 
-  // Query parameters
   const queryParams = { projectId };
 
-  // Build the query string
   const queryString = Object.keys(queryParams)
     .map((key) => `${key}=${queryParams[key as keyof typeof queryParams]}`)
     .join("&");
 
-  // Full URL with query parameters
   const fullUrl = `${baseUrl}${apiPath}?${queryString}`;
 
-  console.log("Zephyr URL:", fullUrl);
-  console.log(
-    "Zephyr Payload:",
-    JSON.stringify({ projectId, step, data, result }, null, 2)
-  );
+  if (process.env.DEBUG === "true") {
+    console.error("[JIRA-MCP] Zephyr URL:", fullUrl);
+    console.error("[JIRA-MCP] Zephyr Payload:", JSON.stringify({ projectId, step, data, result }, null, 2));
+  }
 
   try {
-    // Generate JWT for this specific API call with query parameters
     const jwtToken = generateZephyrJwt("POST", apiPath, queryParams);
 
-    const response = await fetch(fullUrl, {
+    const response = await fetchWithRetry(fullUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -225,42 +218,93 @@ const server = new McpServer({
   version: "1.0.0",
 });
 
+// Convert Markdown / Jira-wiki text to an ADF document node
+function markdownToAdf(text: string): any {
+  const lines = text.split("\n");
+  const nodes: any[] = [];
+  let bulletItems: any[] = [];
+
+  const flushBullets = () => {
+    if (bulletItems.length > 0) {
+      nodes.push({ type: "bulletList", content: bulletItems });
+      bulletItems = [];
+    }
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushBullets();
+      continue;
+    }
+
+    // Markdown heading: ## Title, ### Title, etc.
+    const mdHeading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+    // Jira wiki markup: h2. Title, h3. Title, etc.
+    const jiraHeading = trimmed.match(/^h([1-6])\.\s+(.+)$/);
+
+    if (mdHeading) {
+      flushBullets();
+      const level = mdHeading[1].length;
+      nodes.push({
+        type: "heading",
+        attrs: { level },
+        content: [{ type: "text", text: mdHeading[2] }],
+      });
+    } else if (jiraHeading) {
+      flushBullets();
+      const level = parseInt(jiraHeading[1], 10);
+      nodes.push({
+        type: "heading",
+        attrs: { level },
+        content: [{ type: "text", text: jiraHeading[2] }],
+      });
+    } else if (trimmed.startsWith("- ") || trimmed.startsWith("* ")) {
+      bulletItems.push({
+        type: "listItem",
+        content: [
+          {
+            type: "paragraph",
+            content: [{ type: "text", text: trimmed.substring(2).trim() }],
+          },
+        ],
+      });
+    } else {
+      flushBullets();
+      nodes.push({
+        type: "paragraph",
+        content: [{ type: "text", text: trimmed }],
+      });
+    }
+  }
+
+  flushBullets();
+
+  return {
+    type: "doc",
+    version: 1,
+    content:
+      nodes.length > 0
+        ? nodes
+        : [{ type: "paragraph", content: [{ type: "text", text: "" }] }],
+  };
+}
+
 // Helper function to format text content for JIRA API v3
 function formatJiraContent(
   content: string | undefined,
   defaultText: string = "No content provided"
-) {
-  return content
-    ? {
-        type: "doc",
-        version: 1,
-        content: [
-          {
-            type: "paragraph",
-            content: [
-              {
-                type: "text",
-                text: content,
-              },
-            ],
-          },
-        ],
-      }
-    : {
-        type: "doc",
-        version: 1,
-        content: [
-          {
-            type: "paragraph",
-            content: [
-              {
-                type: "text",
-                text: defaultText,
-              },
-            ],
-          },
-        ],
-      };
+): any {
+  if (!content) {
+    return {
+      type: "doc",
+      version: 1,
+      content: [
+        { type: "paragraph", content: [{ type: "text", text: defaultText }] },
+      ],
+    };
+  }
+  return markdownToAdf(content);
 }
 
 // Helper function to format description for JIRA API v3
@@ -270,75 +314,7 @@ function formatDescription(description: string | undefined) {
 
 // Helper function to format acceptance criteria for JIRA API v3
 function formatAcceptanceCriteria(criteria: string | undefined) {
-  // Check if criteria is undefined or empty
-  if (!criteria) {
-    return {
-      type: "doc",
-      version: 1,
-      content: [
-        {
-          type: "paragraph",
-          content: [
-            {
-              type: "text",
-              text: "No acceptance criteria provided",
-            },
-          ],
-        },
-      ],
-    };
-  }
-
-  // Split criteria by newlines to handle bullet points properly
-  const lines = criteria.split("\n");
-  const content = [];
-
-  for (const line of lines) {
-    const trimmedLine = line.trim();
-
-    // Skip empty lines
-    if (!trimmedLine) continue;
-
-    // Check if line is a bullet point
-    if (trimmedLine.startsWith("-") || trimmedLine.startsWith("*")) {
-      content.push({
-        type: "bulletList",
-        content: [
-          {
-            type: "listItem",
-            content: [
-              {
-                type: "paragraph",
-                content: [
-                  {
-                    type: "text",
-                    text: trimmedLine.substring(1).trim(),
-                  },
-                ],
-              },
-            ],
-          },
-        ],
-      });
-    } else {
-      // Regular paragraph
-      content.push({
-        type: "paragraph",
-        content: [
-          {
-            type: "text",
-            text: trimmedLine,
-          },
-        ],
-      });
-    }
-  }
-
-  return {
-    type: "doc",
-    version: 1,
-    content: content,
-  };
+  return formatJiraContent(criteria, "No acceptance criteria provided");
 }
 
 // Helper function to create a JIRA ticket
@@ -352,13 +328,15 @@ async function createJiraTicket(
 }> {
   const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue`;
 
-  console.log("JIRA URL:", jiraUrl);
-  console.log("JIRA Payload:", JSON.stringify(payload, null, 2));
-  console.log("JIRA Auth:", `Basic ${auth.substring(0, 10)}...`);
-  console.log("JIRA Project Key:", process.env.JIRA_PROJECT_KEY);
+  if (process.env.DEBUG === "true") {
+    console.error("[JIRA-MCP] JIRA URL:", jiraUrl);
+    console.error("[JIRA-MCP] JIRA Payload:", JSON.stringify(payload, null, 2));
+    console.error("[JIRA-MCP] JIRA Auth:", `Basic ${auth.substring(0, 10)}...`);
+    console.error("[JIRA-MCP] JIRA Project Key:", process.env.JIRA_PROJECT_KEY);
+  }
 
   try {
-    const response = await fetch(jiraUrl, {
+    const response = await fetchWithRetry(jiraUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -383,27 +361,28 @@ async function createJiraTicket(
         const productField = process.env.JIRA_PRODUCT_FIELD;
         const categoryField = process.env.JIRA_CATEGORY_FIELD;
 
-        // Check if the error is related to product field
         const hasProductFieldError = productField && responseData.errors[productField];
         const hasCategoryFieldError = categoryField && responseData.errors[categoryField];
 
-        // Handle required product field error specially
         if (hasProductFieldError) {
           const errorMessage = responseData.errors[productField];
-          console.log(`Product field error: ${errorMessage}`);
+          if (process.env.DEBUG === "true") {
+            console.error(`[JIRA-MCP] Product field error: ${errorMessage}`);
+          }
 
-          // Try alternative formats for the product field
           const productValue = process.env.JIRA_PRODUCT_VALUE;
           const productId = process.env.JIRA_PRODUCT_ID;
 
           if (productValue && productId) {
-            console.log("Retrying with alternative product field formats...");
+            if (process.env.DEBUG === "true") {
+              console.error("[JIRA-MCP] Retrying with alternative product field formats...");
+            }
 
             // Try format 1: Just the ID as string
             let retryPayload = JSON.parse(JSON.stringify(payload));
             retryPayload.fields[productField] = productId;
 
-            let retryResponse = await fetch(jiraUrl, {
+            let retryResponse = await fetchWithRetry(jiraUrl, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -414,7 +393,6 @@ async function createJiraTicket(
 
             if (retryResponse.ok) {
               const retryResponseData = (await retryResponse.json()) as JiraCreateResponse;
-              console.log("Ticket created successfully with product field as ID string");
               return { success: true, data: retryResponseData };
             }
 
@@ -422,7 +400,7 @@ async function createJiraTicket(
             retryPayload = JSON.parse(JSON.stringify(payload));
             retryPayload.fields[productField] = [{ id: productId }];
 
-            retryResponse = await fetch(jiraUrl, {
+            retryResponse = await fetchWithRetry(jiraUrl, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -433,7 +411,6 @@ async function createJiraTicket(
 
             if (retryResponse.ok) {
               const retryResponseData = (await retryResponse.json()) as JiraCreateResponse;
-              console.log("Ticket created successfully with product field as array with ID");
               return { success: true, data: retryResponseData };
             }
 
@@ -441,7 +418,7 @@ async function createJiraTicket(
             retryPayload = JSON.parse(JSON.stringify(payload));
             retryPayload.fields[productField] = [{ value: productValue }];
 
-            retryResponse = await fetch(jiraUrl, {
+            retryResponse = await fetchWithRetry(jiraUrl, {
               method: "POST",
               headers: {
                 "Content-Type": "application/json",
@@ -452,21 +429,16 @@ async function createJiraTicket(
 
             if (retryResponse.ok) {
               const retryResponseData = (await retryResponse.json()) as JiraCreateResponse;
-              console.log("Ticket created successfully with product field as array with value");
               return { success: true, data: retryResponseData };
             }
 
-            console.log("All product field format retries failed");
+            if (process.env.DEBUG === "true") {
+              console.error("[JIRA-MCP] All product field format retries failed");
+            }
           }
 
-          // If all retries fail and it's a required field, return helpful error
           if (errorMessage.toLowerCase().includes('required')) {
             console.error(`Required product field ${productField} validation failed with all formats.`);
-            console.error('Current configuration:');
-            console.error('- JIRA_PRODUCT_FIELD:', process.env.JIRA_PRODUCT_FIELD);
-            console.error('- JIRA_PRODUCT_VALUE:', process.env.JIRA_PRODUCT_VALUE);
-            console.error('- JIRA_PRODUCT_ID:', process.env.JIRA_PRODUCT_ID);
-
             return {
               success: false,
               data: responseData,
@@ -477,23 +449,21 @@ async function createJiraTicket(
 
         // For non-required field errors, try removing them
         if ((hasProductFieldError && !responseData.errors[productField].toLowerCase().includes('required')) || hasCategoryFieldError) {
-          console.log("Retrying ticket creation without problematic custom fields...");
+          if (process.env.DEBUG === "true") {
+            console.error("[JIRA-MCP] Retrying ticket creation without problematic custom fields...");
+          }
 
-          // Create a new payload without the problematic custom fields
           const retryPayload = JSON.parse(JSON.stringify(payload));
 
           if (hasProductFieldError && !responseData.errors[productField].toLowerCase().includes('required')) {
             delete retryPayload.fields[productField];
-            console.log(`Removed problematic product field: ${productField}`);
           }
 
           if (hasCategoryFieldError) {
             delete retryPayload.fields[categoryField];
-            console.log(`Removed problematic category field: ${categoryField}`);
           }
 
-          // Retry the request
-          const retryResponse = await fetch(jiraUrl, {
+          const retryResponse = await fetchWithRetry(jiraUrl, {
             method: "POST",
             headers: {
               "Content-Type": "application/json",
@@ -505,7 +475,6 @@ async function createJiraTicket(
           const retryResponseData = (await retryResponse.json()) as JiraCreateResponse;
 
           if (retryResponse.ok) {
-            console.log("Ticket created successfully after removing problematic custom fields");
             return { success: true, data: retryResponseData };
           } else {
             console.error("Retry also failed:", JSON.stringify(retryResponseData, null, 2));
@@ -513,7 +482,6 @@ async function createJiraTicket(
         }
       }
 
-      // Try to extract more detailed error information
       let errorMessage = `Status: ${response.status} ${response.statusText}`;
 
       if (responseData.errorMessages && responseData.errorMessages.length > 0) {
@@ -546,22 +514,18 @@ async function createTicketLink(
   const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issueLink`;
 
   const payload = {
-    outwardIssue: {
-      key: outwardIssue,
-    },
-    inwardIssue: {
-      key: inwardIssue,
-    },
-    type: {
-      name: linkType,
-    },
+    outwardIssue: { key: outwardIssue },
+    inwardIssue: { key: inwardIssue },
+    type: { name: linkType },
   };
 
-  console.log("Creating link between", outwardIssue, "and", inwardIssue);
-  console.log("Link payload:", JSON.stringify(payload, null, 2));
+  if (process.env.DEBUG === "true") {
+    console.error("[JIRA-MCP] Creating link between", outwardIssue, "and", inwardIssue);
+    console.error("[JIRA-MCP] Link payload:", JSON.stringify(payload, null, 2));
+  }
 
   try {
-    const response = await fetch(jiraUrl, {
+    const response = await fetchWithRetry(jiraUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -580,8 +544,7 @@ async function createTicketLink(
         response.statusText
       );
 
-      let errorMessage = `Status: ${response.status} ${response.statusText}`;
-      return { success: false, errorMessage };
+      return { success: false, errorMessage: `Status: ${response.status} ${response.statusText}` };
     }
 
     return { success: true };
@@ -598,22 +561,25 @@ async function createTicketLink(
 async function searchJiraTickets(
   jql: string,
   maxResults: number,
-  auth: string
+  auth: string,
+  fields?: string
 ): Promise<{
   success: boolean;
   data: JiraSearchResponse;
   errorMessage?: string;
 }> {
-  const jiraUrl = `https://${
-    process.env.JIRA_HOST
-  }/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}`;
+  let jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/search/jql?jql=${encodeURIComponent(jql)}&maxResults=${maxResults}`;
+  if (fields) {
+    jiraUrl += `&fields=${encodeURIComponent(fields)}`;
+  }
 
-  console.log("JIRA Search URL:", jiraUrl);
-  console.log("JIRA Search JQL:", jql);
-  console.log("JIRA Auth:", `Basic ${auth.substring(0, 10)}...`);
+  if (process.env.DEBUG === "true") {
+    console.error("[JIRA-MCP] JIRA Search URL:", jiraUrl);
+    console.error("[JIRA-MCP] JIRA Search JQL:", jql);
+  }
 
   try {
-    const response = await fetch(jiraUrl, {
+    const response = await fetchWithRetry(jiraUrl, {
       method: "GET",
       headers: {
         "Content-Type": "application/json",
@@ -632,7 +598,6 @@ async function searchJiraTickets(
         response.statusText
       );
 
-      // Try to extract more detailed error information
       let errorMessage = `Status: ${response.status} ${response.statusText}`;
 
       if (responseData.errorMessages && responseData.errorMessages.length > 0) {
@@ -648,6 +613,66 @@ async function searchJiraTickets(
     return {
       success: false,
       data: {},
+      errorMessage: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+// Helper function to get the internal Jira ID and project ID from a ticket key
+async function getJiraIssueId(
+  ticketKey: string,
+  auth: string
+): Promise<{
+  success: boolean;
+  id?: string;
+  projectId?: string;
+  errorMessage?: string;
+}> {
+  const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticketKey}`;
+
+  try {
+    const response = await fetchWithRetry(jiraUrl, {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Basic ${auth}`,
+      },
+    });
+
+    const responseData = (await response.json()) as JiraGetResponse;
+
+    if (!response.ok) {
+      console.error("Error fetching ticket:", responseData);
+
+      let errorMessage = `Status: ${response.status} ${response.statusText}`;
+      if (responseData.errorMessages && responseData.errorMessages.length > 0) {
+        errorMessage = responseData.errorMessages.join(", ");
+      }
+
+      return { success: false, errorMessage };
+    }
+
+    if (!responseData.id) {
+      return {
+        success: false,
+        errorMessage: "No issue ID found in response",
+      };
+    }
+
+    const projectId = responseData.fields?.project?.id;
+    if (!projectId && process.env.DEBUG === "true") {
+      console.error("[JIRA-MCP] Warning: Project ID not found in response");
+    }
+
+    return {
+      success: true,
+      id: responseData.id,
+      projectId,
+    };
+  } catch (error) {
+    console.error("Exception fetching ticket ID:", error);
+    return {
+      success: false,
       errorMessage: error instanceof Error ? error.message : String(error),
     };
   }
@@ -687,13 +712,11 @@ server.tool(
   }) => {
     const formattedDescription = formatDescription(description);
 
-    // Determine if we should create a test ticket
     const shouldCreateTestTicket =
       create_test_ticket !== undefined
         ? create_test_ticket
         : autoCreateTestTickets;
 
-    // Build the payload for the main ticket
     const payload: any = {
       fields: {
         project: {
@@ -707,24 +730,18 @@ server.tool(
       },
     };
 
-    // Add acceptance criteria if provided
     if (acceptance_criteria !== undefined) {
-      // Using environment variable for acceptance criteria field
       const acceptanceCriteriaField =
         process.env.JIRA_ACCEPTANCE_CRITERIA_FIELD || "customfield_10429";
 
-      // Format and add acceptance criteria to the custom field only, not to description
       payload.fields[acceptanceCriteriaField] =
         formatAcceptanceCriteria(acceptance_criteria);
 
-      // Log for debugging
-      console.log(
-        `Adding acceptance criteria to field ${acceptanceCriteriaField}`
-      );
-      console.log(
-        "Formatted acceptance criteria:",
-        JSON.stringify(formatAcceptanceCriteria(acceptance_criteria), null, 2)
-      );
+      if (process.env.DEBUG === "true") {
+        console.error(
+          `[JIRA-MCP] Adding acceptance criteria to field ${acceptanceCriteriaField}`
+        );
+      }
     }
 
     // Only add custom fields for Bug, Task, and Story issue types. Do NOT add for Epic or Test.
@@ -733,28 +750,20 @@ server.tool(
       issue_type === "Task" ||
       issue_type === "Story"
     ) {
-      // Add product field if configured
       const productField = process.env.JIRA_PRODUCT_FIELD;
       const productValue = process.env.JIRA_PRODUCT_VALUE;
       const productId = process.env.JIRA_PRODUCT_ID;
 
       if (productField && productValue && productId) {
-        // Try different formats for the product field
-        // Some JIRA instances expect just the ID, others expect the full object
-        console.log(`Configuring product field ${productField} with value "${productValue}" and ID "${productId}"`);
-
-        // Try with array format first (as some JIRA instances require arrays)
         payload.fields[productField] = [{
           self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${productId}`,
           value: productValue,
           id: productId,
         }];
-      } else if (productField) {
-        // Product field is configured but missing value or ID
-        console.warn(`Product field ${productField} is configured but missing JIRA_PRODUCT_VALUE or JIRA_PRODUCT_ID`);
+      } else if (productField && process.env.DEBUG === "true") {
+        console.error(`[JIRA-MCP] Product field ${productField} is configured but missing JIRA_PRODUCT_VALUE or JIRA_PRODUCT_ID`);
       }
 
-      // Add category field if configured
       const categoryField = process.env.JIRA_CATEGORY_FIELD;
 
       if (categoryField) {
@@ -779,43 +788,28 @@ server.tool(
       }
     }
 
-    // Add story points if provided
     if (story_points !== undefined && issue_type === "Story") {
-      // Using environment variable for story points field
       const storyPointsField =
         process.env.JIRA_STORY_POINTS_FIELD || "customfield_10040";
       payload.fields[storyPointsField] = story_points;
-
-      // Add QA-Testable label for stories with points
       payload.fields.labels = ["QA-Testable"];
     }
 
-    // Add parent epic/parent link if provided
     if (parent_epic !== undefined) {
       if (issue_type === "Epic") {
-        // For Epic creation, set parent to Initiative key via standard parent field
         payload.fields.parent = { key: parent_epic };
       } else {
-        // For Stories/Tasks/Bugs, set Epic Link
         const epicLinkField =
           process.env.JIRA_EPIC_LINK_FIELD || "customfield_10014";
         payload.fields[epicLinkField] = parent_epic;
       }
     }
 
-    // Add sprint if provided
     if (sprint !== undefined) {
-      // Sprint field is customfield_10020 based on our query
-      payload.fields["customfield_10020"] = [
-        {
-          name: sprint,
-        },
-      ];
+      payload.fields["customfield_10020"] = [{ name: sprint }];
     }
 
-    // Add story readiness if provided
     if (story_readiness !== undefined) {
-      // Story Readiness field is customfield_10596 based on our query
       const storyReadinessId = story_readiness === "Yes" ? "18256" : "18257";
       payload.fields["customfield_10596"] = {
         self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${storyReadinessId}`,
@@ -824,10 +818,7 @@ server.tool(
       };
     }
 
-    // Add crisis field if provided
     if (crisis !== undefined) {
-      // Crisis field configuration from environment variables
-      // Set JIRA_CRISIS_FIELD to your project's crisis custom field ID
       const crisisField = process.env.JIRA_CRISIS_FIELD || "customfield_14238";
       const crisisId = crisis === "Yes"
         ? process.env.JIRA_CRISIS_YES_ID || "23123"
@@ -840,12 +831,10 @@ server.tool(
       };
     }
 
-    // Create the auth token
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
 
-    // Create the main ticket
     const result = await createJiraTicket(payload, auth);
 
     if (!result.success) {
@@ -859,7 +848,6 @@ server.tool(
       };
     }
 
-    // Extract the ticket key/number from the response
     const ticketKey = result.data.key;
     let responseText = `Created ticket ${ticketKey} with summary: ${summary}, description: ${
       description || "No description"
@@ -873,37 +861,32 @@ server.tool(
       responseText += `, story points: ${story_points}`;
     }
 
-    // Create a test ticket if this is a Story with points and auto-creation is enabled
     if (
       shouldCreateTestTicket &&
       issue_type === "Story" &&
       story_points !== undefined &&
       ticketKey
     ) {
-      // Create a test ticket linked to the story
       const testTicketPayload: any = {
         fields: {
           project: {
             key: process.env.JIRA_PROJECT_KEY || "SCRUM",
           },
           summary: `${ticketKey} ${summary}`,
-          description: formatDescription(summary), // Use story title as description
+          description: formatDescription(summary),
           issuetype: {
             name: "Test",
           },
-          // Don't include custom fields for Test issue type as they may not be available
         },
       };
 
-      // Create the test ticket
       const testResult = await createJiraTicket(testTicketPayload, auth);
 
       if (testResult.success && testResult.data.key) {
-        // Link the test ticket to the story
         const linkResult = await createTicketLink(
           ticketKey,
           testResult.data.key,
-          "Test Case Linking", // "is tested by" relationship
+          "Test Case Linking",
           auth
         );
 
@@ -940,12 +923,10 @@ server.tool(
       .default("Test Case Linking"),
   },
   async ({ outward_issue, inward_issue, link_type }) => {
-    // Create the auth token
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
 
-    // Create the link
     const result = await createTicketLink(
       outward_issue,
       inward_issue,
@@ -988,7 +969,7 @@ server.tool(
     ).toString("base64");
 
     try {
-      const response = await fetch(jiraUrl, {
+      const response = await fetchWithRetry(jiraUrl, {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
@@ -1065,23 +1046,19 @@ server.tool(
   {
     issue_type: z.enum(["Bug", "Task", "Story", "Test", "Epic"]),
     max_results: z.number().min(1).max(50).default(10).optional(),
-    additional_criteria: z.string().optional(), // For additional JQL criteria
+    additional_criteria: z.string().optional(),
   },
   async ({ issue_type, max_results = 10, additional_criteria }) => {
-    // Create the auth token
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
 
-    // Construct the JQL query
     let jql = `project = "${process.env.JIRA_PROJECT_KEY}" AND issuetype = "${issue_type}"`;
 
-    // Add additional criteria if provided
     if (additional_criteria) {
       jql += ` AND (${additional_criteria})`;
     }
 
-    // Search for tickets
     const result = await searchJiraTickets(jql, max_results, auth);
 
     if (!result.success) {
@@ -1095,7 +1072,6 @@ server.tool(
       };
     }
 
-    // Check if we have results
     if (!result.data.issues || result.data.issues.length === 0) {
       return {
         content: [
@@ -1107,7 +1083,6 @@ server.tool(
       };
     }
 
-    // Format the results
     const tickets = result.data.issues.map((issue) => ({
       key: issue.key,
       summary: issue.fields.summary,
@@ -1134,15 +1109,14 @@ server.tool(
   {
     jql: z.string().min(1, "JQL query is required"),
     max_results: z.number().min(1).max(50).default(10).optional(),
+    fields: z.string().optional().describe("Comma-separated list of fields to return (e.g. 'summary,status,issuetype'). Omit to get all fields."),
   },
-  async ({ jql, max_results = 10 }) => {
-    // Create the auth token
+  async ({ jql, max_results = 10, fields }) => {
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
 
-    // Search for tickets using the provided JQL
-    const result = await searchJiraTickets(jql, max_results, auth);
+    const result = await searchJiraTickets(jql, max_results, auth, fields);
 
     if (!result.success) {
       return {
@@ -1155,7 +1129,6 @@ server.tool(
       };
     }
 
-    // Check if we have results
     if (!result.data.issues || result.data.issues.length === 0) {
       return {
         content: [
@@ -1167,7 +1140,6 @@ server.tool(
       };
     }
 
-    // Format the results
     const tickets = result.data.issues.map((issue) => ({
       key: issue.key,
       summary: issue.fields.summary,
@@ -1190,70 +1162,6 @@ server.tool(
   }
 );
 
-// Helper function to get the internal Jira ID and project ID from a ticket key
-async function getJiraIssueId(
-  ticketKey: string,
-  auth: string
-): Promise<{
-  success: boolean;
-  id?: string;
-  projectId?: string;
-  errorMessage?: string;
-}> {
-  const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticketKey}`;
-
-  try {
-    const response = await fetch(jiraUrl, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Basic ${auth}`,
-      },
-    });
-
-    const responseData = (await response.json()) as JiraGetResponse;
-
-    if (!response.ok) {
-      console.error("Error fetching ticket:", responseData);
-
-      let errorMessage = `Status: ${response.status} ${response.statusText}`;
-      if (responseData.errorMessages && responseData.errorMessages.length > 0) {
-        errorMessage = responseData.errorMessages.join(", ");
-      }
-
-      return { success: false, errorMessage };
-    }
-
-    if (!responseData.id) {
-      return {
-        success: false,
-        errorMessage: "No issue ID found in response",
-      };
-    }
-
-    // Extract project ID from the response
-    const projectId = responseData.fields?.project?.id;
-    if (!projectId) {
-      console.log("Warning: Project ID not found in response");
-    } else {
-      console.log(`Found project ID: ${projectId}`);
-    }
-
-    return {
-      success: true,
-      id: responseData.id,
-      projectId,
-    };
-  } catch (error) {
-    console.error("Exception fetching ticket ID:", error);
-    return {
-      success: false,
-      errorMessage: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-// Register new tool for updating tickets
 server.tool(
   "update-ticket",
   "Update an existing jira ticket",
@@ -1263,29 +1171,19 @@ server.tool(
     story_readiness: z.enum(["Yes", "No"]).optional(),
   },
   async ({ ticket_key, sprint, story_readiness }) => {
-    // Create the auth token
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
 
-    // Build the payload for the update
     const payload: any = {
       fields: {},
     };
 
-    // Add sprint if provided
     if (sprint !== undefined) {
-      // Sprint field is customfield_10020 based on our query
-      payload.fields["customfield_10020"] = [
-        {
-          name: sprint,
-        },
-      ];
+      payload.fields["customfield_10020"] = [{ name: sprint }];
     }
 
-    // Add story readiness if provided
     if (story_readiness !== undefined) {
-      // Story Readiness field is customfield_10596 based on our query
       const storyReadinessId = story_readiness === "Yes" ? "18256" : "18257";
       payload.fields["customfield_10596"] = {
         self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${storyReadinessId}`,
@@ -1294,7 +1192,6 @@ server.tool(
       };
     }
 
-    // If no fields were provided, return an error
     if (Object.keys(payload.fields).length === 0) {
       return {
         content: [
@@ -1306,7 +1203,6 @@ server.tool(
       };
     }
 
-    // Update the ticket
     const result = await updateJiraTicket(ticket_key, payload, auth);
 
     if (!result.success) {
@@ -1320,7 +1216,6 @@ server.tool(
       };
     }
 
-    // Build response text
     let responseText = `Successfully updated ticket ${ticket_key}`;
     if (sprint !== undefined) {
       responseText += `, sprint: ${sprint}`;
@@ -1340,7 +1235,178 @@ server.tool(
   }
 );
 
-// Register new tool for getting Zephyr test steps
+server.tool(
+  "add-comment",
+  "Add a comment to a Jira ticket",
+  {
+    ticket_key: z.string().min(1, "Ticket key is required"),
+    body: z.string().min(1, "Comment body is required"),
+  },
+  async ({ ticket_key, body }) => {
+    const auth = Buffer.from(
+      `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
+    ).toString("base64");
+    const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticket_key}/comment`;
+
+    try {
+      const response = await fetchWithRetry(jiraUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${auth}`,
+        },
+        body: JSON.stringify({ body: markdownToAdf(body) }),
+      });
+
+      if (!response.ok) {
+        const errorData = (await response.json()) as any;
+        console.error("Error adding comment:", errorData);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error adding comment: Status ${response.status} ${response.statusText}`,
+            },
+          ],
+        };
+      }
+
+      const data = (await response.json()) as any;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Comment added successfully to ${ticket_key} (id: ${data.id})`,
+          },
+        ],
+      };
+    } catch (error) {
+      console.error("Exception adding comment:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error adding comment: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "edit-comment",
+  "Edit an existing comment on a Jira ticket",
+  {
+    ticket_key: z.string().min(1, "Ticket key is required"),
+    comment_id: z.string().min(1, "Comment ID is required"),
+    body: z.string().min(1, "New comment body is required"),
+  },
+  async ({ ticket_key, comment_id, body }) => {
+    const auth = Buffer.from(
+      `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
+    ).toString("base64");
+    const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticket_key}/comment/${comment_id}`;
+
+    try {
+      const response = await fetchWithRetry(jiraUrl, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${auth}`,
+        },
+        body: JSON.stringify({ body: markdownToAdf(body) }),
+      });
+
+      if (!response.ok) {
+        const errorData = (await response.json()) as any;
+        console.error("Error editing comment:", errorData);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error editing comment: Status ${response.status} ${response.statusText}`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Comment ${comment_id} on ${ticket_key} updated successfully`,
+          },
+        ],
+      };
+    } catch (error) {
+      console.error("Exception editing comment:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error editing comment: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "remove-issue-link",
+  "Remove a link between two Jira tickets by link ID",
+  {
+    link_id: z.string().min(1, "Link ID is required"),
+  },
+  async ({ link_id }) => {
+    const auth = Buffer.from(
+      `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
+    ).toString("base64");
+    const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issueLink/${link_id}`;
+
+    try {
+      const response = await fetchWithRetry(jiraUrl, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Basic ${auth}`,
+        },
+      });
+
+      if (!response.ok) {
+        console.error("Error removing link: Status", response.status, response.statusText);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error removing link: Status ${response.status} ${response.statusText}`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Link ${link_id} removed successfully`,
+          },
+        ],
+      };
+    } catch (error) {
+      console.error("Exception removing link:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error removing link: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
 server.tool(
   "get-test-steps",
   "Get test steps from a test ticket via Zephyr integration",
@@ -1348,12 +1414,10 @@ server.tool(
     ticket_key: z.string().min(1, "Ticket key is required"),
   },
   async ({ ticket_key }) => {
-    // Create the auth token for Jira API
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
 
-    // Get the internal Jira ID from the ticket key
     const idResult = await getJiraIssueId(ticket_key, auth);
 
     if (!idResult.success || !idResult.id) {
@@ -1368,10 +1432,7 @@ server.tool(
     }
 
     const issueId = idResult.id;
-    console.log(`Found internal ID for ticket ${ticket_key}: ${issueId}`);
 
-    // Get the test steps
-    // Make sure we have the project ID
     const projectId = idResult.projectId;
     if (!projectId) {
       console.error("Project ID not found, cannot get test steps");
@@ -1398,7 +1459,6 @@ server.tool(
       };
     }
 
-    // Check if we have test steps
     if (!result.steps || result.steps.length === 0) {
       return {
         content: [
@@ -1410,7 +1470,6 @@ server.tool(
       };
     }
 
-    // Format the test steps
     const formattedSteps = result.steps.map((step) => ({
       id: step.id,
       orderId: step.orderId,
@@ -1436,7 +1495,6 @@ server.tool(
   }
 );
 
-// Register new tool for adding test steps
 server.tool(
   "add-test-steps",
   "Add test steps to a test ticket via Zephyr integration",
@@ -1453,12 +1511,10 @@ server.tool(
       .min(1, "At least one test step is required"),
   },
   async ({ ticket_key, steps }) => {
-    // Create the auth token for Jira API
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
 
-    // Get the internal Jira ID from the ticket key
     const idResult = await getJiraIssueId(ticket_key, auth);
 
     if (!idResult.success || !idResult.id) {
@@ -1473,16 +1529,11 @@ server.tool(
     }
 
     const issueId = idResult.id;
-    console.log(`Found internal ID for ticket ${ticket_key}: ${issueId}`);
 
-    // Add each test step
     const results: string[] = [];
     let allSuccessful = true;
 
     for (const [index, { step, data = "", result = "" }] of steps.entries()) {
-      console.log(`Adding test step ${index + 1}/${steps.length}: ${step}`);
-
-      // Pass the project ID to the addZephyrTestStep function
       const projectId = idResult.projectId;
       if (!projectId) {
         console.error("Project ID not found, cannot add test steps");
@@ -1512,7 +1563,6 @@ server.tool(
       }
     }
 
-    // Return the results
     if (allSuccessful) {
       return {
         content: [

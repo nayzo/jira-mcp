@@ -1,4 +1,4 @@
-import fetch from "node-fetch";
+import { fetchWithRetry } from "./http.js";
 
 // Helper function to update a JIRA ticket
 export async function updateJiraTicket(
@@ -11,12 +11,13 @@ export async function updateJiraTicket(
 }> {
   const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticketKey}`;
 
-  console.log("JIRA Update URL:", jiraUrl);
-  console.log("JIRA Update Payload:", JSON.stringify(payload, null, 2));
-  console.log("JIRA Auth:", `Basic ${auth.substring(0, 10)}...`);
+  if (process.env.DEBUG === "true") {
+    console.error("[JIRA-MCP] JIRA Update URL:", jiraUrl);
+    console.error("[JIRA-MCP] JIRA Update Payload:", JSON.stringify(payload, null, 2));
+  }
 
   try {
-    const response = await fetch(jiraUrl, {
+    const response = await fetchWithRetry(jiraUrl, {
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
@@ -30,7 +31,6 @@ export async function updateJiraTicket(
       return { success: true };
     }
 
-    // If there's an error, try to parse the response
     let errorMessage = `Status: ${response.status} ${response.statusText}`;
     try {
       const responseData = (await response.json()) as {
