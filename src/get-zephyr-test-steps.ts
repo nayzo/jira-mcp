@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
-import fetch from "node-fetch";
+import { fetchWithRetry } from "./http.js";
 
 // Type for Zephyr test step response
 export type ZephyrTestStep = {
@@ -67,62 +67,53 @@ export async function getZephyrTestSteps(
   steps?: ZephyrTestStep[];
   errorMessage?: string;
 }> {
-  // Zephyr base URL from environment variable
   const baseUrl =
     process.env.ZAPI_BASE_URL ||
     "https://prod-api.zephyr4jiracloud.com/connect";
 
-  // Use the correct API endpoint format for Zephyr Squad Cloud
-  // The correct format is /public/rest/api/1.0/teststep/{issueId} (without trailing slash)
   const apiPath = `/public/rest/api/1.0/teststep/${issueId}`;
-
-  // Query parameters
   const queryParams = { projectId };
 
-  // Build the query string
   const queryString = Object.keys(queryParams)
     .map((key) => `${key}=${queryParams[key as keyof typeof queryParams]}`)
     .join("&");
 
-  // Full URL with query parameters
   const fullUrl = `${baseUrl}${apiPath}?${queryString}`;
 
-  console.log("Zephyr URL for getting test steps:", fullUrl);
-  console.log("Zephyr API Path:", apiPath);
-  console.log("Issue ID:", issueId);
-  console.log("Project ID:", projectId);
-  console.log("Query Parameters:", queryParams);
+  if (process.env.DEBUG === "true") {
+    console.error("[JIRA-MCP] Zephyr URL for getting test steps:", fullUrl);
+    console.error("[JIRA-MCP] Zephyr API Path:", apiPath);
+    console.error("[JIRA-MCP] Issue ID:", issueId);
+    console.error("[JIRA-MCP] Project ID:", projectId);
+  }
 
   try {
-    // Generate JWT for this specific API call with query parameters
     const jwtToken = generateZephyrJwt("GET", apiPath, queryParams);
-    console.log("Generated JWT token for Zephyr API");
 
-    // Log headers for debugging
     const headers = {
       "Content-Type": "application/json",
       zapiAccessKey: process.env.ZAPI_ACCESS_KEY || "",
       Authorization: `JWT ${jwtToken}`,
     };
-    console.log("Request headers:", JSON.stringify(headers, null, 2));
 
-    const response = await fetch(fullUrl, {
+    const response = await fetchWithRetry(fullUrl, {
       method: "GET",
       headers,
     });
 
-    console.log("Response status:", response.status, response.statusText);
-
-    // Clone the response to read it twice
     const responseClone = response.clone();
     const responseText = await responseClone.text();
-    console.log("Full response body:", responseText);
+
+    if (process.env.DEBUG === "true") {
+      console.error("[JIRA-MCP] Response status:", response.status, response.statusText);
+      console.error("[JIRA-MCP] Full response body:", responseText);
+    }
 
     let responseData;
     try {
       responseData = JSON.parse(responseText);
     } catch (e) {
-      console.error("Error parsing response as JSON:", e);
+      console.error("Error parsing Zephyr response as JSON:", e);
       responseData = {
         error: "Could not parse response as JSON",
         text: responseText,
@@ -144,13 +135,11 @@ export async function getZephyrTestSteps(
       };
     }
 
-    // Check if the response is an array of test steps
     if (Array.isArray(responseData)) {
       return { success: true, steps: responseData as ZephyrTestStep[] };
     } else {
-      // If the response is not an array, it might be a single test step or an error
       console.error(
-        "Unexpected response format:",
+        "Unexpected Zephyr response format:",
         JSON.stringify(responseData as Record<string, unknown>, null, 2)
       );
       return {
@@ -180,7 +169,7 @@ export async function getJiraIssueId(
   const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticketKey}`;
 
   try {
-    const response = await fetch(jiraUrl, {
+    const response = await fetchWithRetry(jiraUrl, {
       method: "GET",
       headers: {
         "Content-Type": "application/json",
@@ -216,12 +205,9 @@ export async function getJiraIssueId(
       };
     }
 
-    // Extract project ID from the response
     const projectId = responseData.fields?.project?.id;
-    if (!projectId) {
-      console.log("Warning: Project ID not found in response");
-    } else {
-      console.log(`Found project ID: ${projectId}`);
+    if (!projectId && process.env.DEBUG === "true") {
+      console.error("[JIRA-MCP] Warning: Project ID not found in response");
     }
 
     return {
