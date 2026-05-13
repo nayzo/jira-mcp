@@ -44,3 +44,5 @@ ValidationEpic.md
 /*.mjs
 !/jest.config.js
 !/eslint.config.js
+
+.claude
