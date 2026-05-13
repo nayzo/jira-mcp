@@ -1,9 +1,10 @@
 // Helper functions for formatting data for JIRA API
 
-// Parse inline Markdown (code, bold) into ADF text nodes
+// Parse inline Markdown and Jira Wiki Markup (code, bold) into ADF text nodes
+// Handles: `backtick`, {{wiki}}, **bold**
 function parseInlineMarkdown(text: string): any[] {
   const nodes: any[] = [];
-  const regex = /(`[^`]+`|\*\*[^*]+\*\*)/g;
+  const regex = /(`[^`]+`|\{\{[^}]+\}\}|\*\*[^*]+\*\*)/g;
   let lastIndex = 0;
   let match;
 
@@ -15,6 +16,8 @@ function parseInlineMarkdown(text: string): any[] {
     const matched = match[0];
     if (matched.startsWith("`")) {
       nodes.push({ type: "text", text: matched.slice(1, -1), marks: [{ type: "code" }] });
+    } else if (matched.startsWith("{{")) {
+      nodes.push({ type: "text", text: matched.slice(2, -2), marks: [{ type: "code" }] });
     } else {
       nodes.push({ type: "text", text: matched.slice(2, -2), marks: [{ type: "strong" }] });
     }
@@ -49,12 +52,15 @@ export function formatJiraContent(
   while (i < lines.length) {
     const line = lines[i];
 
-    // Headings: ## Title → heading level 2
-    const headingMatch = line.match(/^(#{1,6})\s+(.+)/);
+    // Headings: ## Title (Markdown) or h2. Title (Jira Wiki Markup)
+    const mdHeadingMatch = line.match(/^(#{1,6})\s+(.+)/);
+    const wikiHeadingMatch = line.match(/^h([1-6])\.\s+(.+)/);
+    const headingMatch = mdHeadingMatch ?? wikiHeadingMatch;
     if (headingMatch) {
+      const level = mdHeadingMatch ? headingMatch[1].length : parseInt(headingMatch[1], 10);
       adfContent.push({
         type: "heading",
-        attrs: { level: headingMatch[1].length },
+        attrs: { level },
         content: parseInlineMarkdown(headingMatch[2]),
       });
       i++;
