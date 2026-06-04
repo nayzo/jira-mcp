@@ -40,7 +40,7 @@ export function registerJiraTools(server: McpServer) {
     "Create a jira ticket",
     {
       summary: z.string().min(1, "Summary is required"),
-      issue_type: z.enum(["Bug", "Task", "Story", "Test"]).default("Task"),
+      issue_type: z.enum(["Bug", "Task", "Story", "Test", "Epic"]).default("Task"),
       description: z.string().optional(),
       acceptance_criteria: z.string().optional(),
       story_points: z.number().optional(),
@@ -48,6 +48,7 @@ export function registerJiraTools(server: McpServer) {
       parent_epic: z.string().optional(),
       sprint: z.string().optional(),
       story_readiness: z.enum(["Yes", "No"]).optional(),
+      assignee: z.string().optional().describe("Account ID to assign the ticket to. Falls back to JIRA_DEFAULT_ASSIGNEE_ACCOUNT_ID env var."),
     },
     async ({
       summary,
@@ -59,6 +60,7 @@ export function registerJiraTools(server: McpServer) {
       parent_epic,
       sprint,
       story_readiness,
+      assignee,
     }) => {
       const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue`;
 
@@ -104,8 +106,14 @@ export function registerJiraTools(server: McpServer) {
         );
       }
 
-      // Only add custom fields for Bug, Task, and Story issue types, not for Test
-      if (issue_type !== "Test") {
+      // Add assignee: explicit param takes priority, then env var default
+      const assigneeId = assignee ?? process.env.JIRA_DEFAULT_ASSIGNEE_ACCOUNT_ID;
+      if (assigneeId) {
+        payload.fields.assignee = { accountId: assigneeId };
+      }
+
+      // Only add custom fields for Bug, Task, and Story issue types, not for Test or Epic
+      if (issue_type !== "Test" && issue_type !== "Epic") {
         // Add product field if configured
         const productField = process.env.JIRA_PRODUCT_FIELD;
         const productValue = process.env.JIRA_PRODUCT_VALUE;
@@ -146,15 +154,13 @@ export function registerJiraTools(server: McpServer) {
         }
       }
 
-      // Add story points if provided
+      // Add story points if provided and field is configured
       if (story_points !== undefined && issue_type === "Story") {
-        // Using environment variable for story points field
-        const storyPointsField =
-          process.env.JIRA_STORY_POINTS_FIELD || "customfield_10040";
-        payload.fields[storyPointsField] = story_points;
-
-        // Add QA-Testable label for stories with points
-        payload.fields.labels = ["QA-Testable"];
+        const storyPointsField = process.env.JIRA_STORY_POINTS_FIELD;
+        if (storyPointsField) {
+          payload.fields[storyPointsField] = story_points;
+          payload.fields.labels = ["QA-Testable"];
+        }
       }
 
       // Add parent if provided (Jira hierarchy: Story under Epic, Task under Epic, etc.)
@@ -216,11 +222,12 @@ export function registerJiraTools(server: McpServer) {
         responseText += `, story points: ${story_points}`;
       }
 
-      // Create a test ticket if this is a Story with points and auto-creation is enabled
+      // Create a test ticket if this is a Story with points, field is configured, and auto-creation is enabled
       if (
         shouldCreateTestTicket &&
         issue_type === "Story" &&
         story_points !== undefined &&
+        process.env.JIRA_STORY_POINTS_FIELD &&
         ticketKey
       ) {
         // Create a test ticket linked to the story
@@ -409,7 +416,7 @@ export function registerJiraTools(server: McpServer) {
     "search-tickets",
     "Search for jira tickets by issue type",
     {
-      issue_type: z.enum(["Bug", "Task", "Story", "Test"]),
+      issue_type: z.enum(["Bug", "Task", "Story", "Test", "Epic"]),
       max_results: z.number().min(1).max(50).default(10).optional(),
       additional_criteria: z.string().optional(), // For additional JQL criteria
     },
