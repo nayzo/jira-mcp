@@ -819,16 +819,17 @@ server.tool(
     }
 
     if (crisis !== undefined) {
-      const crisisField = process.env.JIRA_CRISIS_FIELD || "customfield_14238";
-      const crisisId = crisis === "Yes"
-        ? process.env.JIRA_CRISIS_YES_ID || "23123"
-        : process.env.JIRA_CRISIS_NO_ID || "23124";
-
-      payload.fields[crisisField] = {
-        self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${crisisId}`,
-        value: crisis,
-        id: crisisId,
-      };
+      const crisisField = process.env.JIRA_CRISIS_FIELD;
+      const crisisYesId = process.env.JIRA_CRISIS_YES_ID;
+      const crisisNoId = process.env.JIRA_CRISIS_NO_ID;
+      if (crisisField && crisisYesId && crisisNoId) {
+        const crisisId = crisis === "Yes" ? crisisYesId : crisisNoId;
+        payload.fields[crisisField] = {
+          self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${crisisId}`,
+          value: crisis,
+          id: crisisId,
+        };
+      }
     }
 
     const auth = Buffer.from(

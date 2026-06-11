@@ -178,15 +178,19 @@ export function registerJiraTools(server: McpServer) {
         ];
       }
 
-      // Add story readiness if provided
+      // Add story readiness if provided and field is configured
       if (story_readiness !== undefined) {
-        // Story Readiness field is customfield_10596 based on our query
-        const storyReadinessId = story_readiness === "Yes" ? "18256" : "18257";
-        payload.fields["customfield_10596"] = {
-          self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${storyReadinessId}`,
-          value: story_readiness,
-          id: storyReadinessId,
-        };
+        const storyReadinessField = process.env.JIRA_STORY_READINESS_FIELD;
+        const storyReadinessYesId = process.env.JIRA_STORY_READINESS_YES_ID;
+        const storyReadinessNoId = process.env.JIRA_STORY_READINESS_NO_ID;
+        if (storyReadinessField && storyReadinessYesId && storyReadinessNoId) {
+          const storyReadinessId = story_readiness === "Yes" ? storyReadinessYesId : storyReadinessNoId;
+          payload.fields[storyReadinessField] = {
+            self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${storyReadinessId}`,
+            value: story_readiness,
+            id: storyReadinessId,
+          };
+        }
       }
 
       // Create the auth token
