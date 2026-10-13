@@ -1175,7 +1175,7 @@ server.tool(
       .min(1)
       .optional()
       .describe(
-        "Replaces the whole description. Markdown headings, bullet lists, **bold** and `code` are converted to ADF"
+        "Replaces the whole description. Markdown headings, bullet lists, fenced code blocks, links, **bold** and `code` are converted to ADF"
       ),
     sprint: z.string().optional(),
     story_readiness: z.enum(["Yes", "No"]).optional(),
@@ -1370,6 +1370,61 @@ server.tool(
           {
             type: "text",
             text: `Error editing comment: ${error instanceof Error ? error.message : String(error)}`,
+          },
+        ],
+      };
+    }
+  }
+);
+
+server.tool(
+  "delete-comment",
+  "Delete a comment from a Jira ticket. This cannot be undone",
+  {
+    ticket_key: z.string().min(1, "Ticket key is required"),
+    comment_id: z.string().min(1, "Comment ID is required"),
+  },
+  async ({ ticket_key, comment_id }) => {
+    const auth = Buffer.from(
+      `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
+    ).toString("base64");
+    const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticket_key}/comment/${comment_id}`;
+
+    try {
+      const response = await fetchWithRetry(jiraUrl, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Basic ${auth}`,
+        },
+      });
+
+      if (!response.ok) {
+        console.error("Error deleting comment:", response.status, response.statusText);
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error deleting comment: Status ${response.status} ${response.statusText}`,
+            },
+          ],
+        };
+      }
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Comment ${comment_id} on ${ticket_key} deleted successfully`,
+          },
+        ],
+      };
+    } catch (error) {
+      console.error("Exception deleting comment:", error);
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error deleting comment: ${error instanceof Error ? error.message : String(error)}`,
           },
         ],
       };
