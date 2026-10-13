@@ -1,10 +1,10 @@
 // Helper functions for formatting data for JIRA API
 
-// Parse inline Markdown and Jira Wiki Markup (code, bold) into ADF text nodes
-// Handles: `backtick`, {{wiki}}, **bold**
+// Parse inline Markdown and Jira Wiki Markup (code, bold, links) into ADF text nodes
+// Handles: `backtick`, {{wiki}}, **bold**, [label](url), bare http(s) URLs
 function parseInlineMarkdown(text: string): any[] {
   const nodes: any[] = [];
-  const regex = /(`[^`]+`|\{\{[^}]+\}\}|\*\*[^*]+\*\*)/g;
+  const regex = /(`[^`]+`|\{\{[^}]+\}\}|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<>]*[^\s<>.,;:!?)])/g;
   let lastIndex = 0;
   let match;
 
@@ -18,8 +18,13 @@ function parseInlineMarkdown(text: string): any[] {
       nodes.push({ type: "text", text: matched.slice(1, -1), marks: [{ type: "code" }] });
     } else if (matched.startsWith("{{")) {
       nodes.push({ type: "text", text: matched.slice(2, -2), marks: [{ type: "code" }] });
-    } else {
+    } else if (matched.startsWith("**")) {
       nodes.push({ type: "text", text: matched.slice(2, -2), marks: [{ type: "strong" }] });
+    } else if (matched.startsWith("[")) {
+      const link = matched.match(/^\[([^\]]+)\]\((.+)\)$/)!;
+      nodes.push({ type: "text", text: link[1], marks: [{ type: "link", attrs: { href: link[2] } }] });
+    } else {
+      nodes.push({ type: "text", text: matched, marks: [{ type: "link", attrs: { href: matched } }] });
     }
 
     lastIndex = match.index + matched.length;
@@ -64,6 +69,23 @@ export function formatJiraContent(
         content: parseInlineMarkdown(headingMatch[2]),
       });
       i++;
+      continue;
+    }
+
+    // Fenced code block: ```lang ... ```
+    const fenceMatch = line.match(/^```\s*(\S*)\s*$/);
+    if (fenceMatch) {
+      const codeLines: string[] = [];
+      i++;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      i++;
+      const codeBlock: any = { type: "codeBlock" };
+      if (fenceMatch[1]) codeBlock.attrs = { language: fenceMatch[1] };
+      if (codeLines.length > 0) codeBlock.content = [{ type: "text", text: codeLines.join("\n") }];
+      adfContent.push(codeBlock);
       continue;
     }
 

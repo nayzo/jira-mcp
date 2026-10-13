@@ -70,6 +70,7 @@ Custom field IDs (story points, acceptance criteria, epic link, etc.) are config
 |---|---|
 | `add-comment` | Add a comment (Markdown → ADF) |
 | `list-comments` | List comments on a ticket |
+| `delete-comment` | Delete a comment by ID (cannot be undone) |
 | `add-worklog` | Log time spent (`2h 30m`, `1d`…) with optional comment |
 
 ### Watchers
@@ -108,6 +109,7 @@ Descriptions and comments accept Markdown — converted to Atlassian Document Fo
 - `- bullet list`
 - `` `inline code` ``
 - `**bold**`
+- fenced code blocks and links, `[label](url)` or bare URLs (descriptions set through `update-ticket`)
 
 ---
 
