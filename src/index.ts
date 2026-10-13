@@ -26,6 +26,7 @@ import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { fetchWithRetry } from "./http.js";
 import { updateJiraTicket } from "./update-ticket.js";
+import { formatDescription as formatRichDescription } from "./jira/formatting.js";
 import { getZephyrTestSteps } from "./get-zephyr-test-steps.js";
 
 // Define types for JIRA and Zephyr responses
@@ -1168,10 +1169,18 @@ server.tool(
   "Update an existing jira ticket",
   {
     ticket_key: z.string().min(1, "Ticket key is required"),
+    summary: z.string().min(1).optional(),
+    description: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Replaces the whole description. Markdown headings, bullet lists, **bold** and `code` are converted to ADF"
+      ),
     sprint: z.string().optional(),
     story_readiness: z.enum(["Yes", "No"]).optional(),
   },
-  async ({ ticket_key, sprint, story_readiness }) => {
+  async ({ ticket_key, summary, description, sprint, story_readiness }) => {
     const auth = Buffer.from(
       `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
     ).toString("base64");
@@ -1179,6 +1188,14 @@ server.tool(
     const payload: any = {
       fields: {},
     };
+
+    if (summary !== undefined) {
+      payload.fields["summary"] = summary;
+    }
+
+    if (description !== undefined) {
+      payload.fields["description"] = formatRichDescription(description);
+    }
 
     if (sprint !== undefined) {
       payload.fields["customfield_10020"] = [{ name: sprint }];
@@ -1218,6 +1235,12 @@ server.tool(
     }
 
     let responseText = `Successfully updated ticket ${ticket_key}`;
+    if (summary !== undefined) {
+      responseText += `, summary updated`;
+    }
+    if (description !== undefined) {
+      responseText += `, description updated`;
+    }
     if (sprint !== undefined) {
       responseText += `, sprint: ${sprint}`;
     }
