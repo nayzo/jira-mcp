@@ -33,7 +33,7 @@ try {
     try {
         settings = JSON.parse(settingsContent);
     } catch (e) {
-        console.error('Error parsing settings file:', e.message);
+        console.error('Error parsing settings file.');
         console.error('Attempting to fix JSON format issues...');
 
         // More aggressive fixing
@@ -59,6 +59,6 @@ try {
 
     console.log('Successfully updated MCP settings for jira-mcp.');
 } catch (error) {
-    console.error('Error updating MCP settings:', error.message);
+    console.error('Error updating MCP settings.');
     process.exit(1);
 }

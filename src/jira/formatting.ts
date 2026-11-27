@@ -89,7 +89,7 @@ export function formatJiraContent(
       continue;
     }
 
-    // Bullet list items — group consecutive ones into a single bulletList node
+    // Group consecutive bullet points into a single list.
     if (/^[-*]\s+/.test(line)) {
       const listItems: any[] = [];
       while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
@@ -127,131 +127,56 @@ export function formatDescription(description: string | undefined) {
   return formatJiraContent(description, "No description provided");
 }
 
-// Helper function to format acceptance criteria for JIRA API v3
-export function formatAcceptanceCriteria(criteria: string | undefined) {
-  // Check if criteria is undefined or empty
-  if (!criteria) {
-    return {
-      type: "doc",
-      version: 1,
-      content: [
-        {
-          type: "paragraph",
-          content: [
-            {
-              type: "text",
-              text: "No acceptance criteria provided",
-            },
-          ],
-        },
-      ],
-    };
-  }
+type AdfNode = {
+  type?: string;
+  text?: string;
+  content?: AdfNode[];
+  attrs?: { level?: number; language?: string; href?: string; url?: string; text?: string; order?: number };
+  marks?: { type: string; attrs?: { href?: string } }[];
+};
 
-  // Split criteria by newlines to handle bullet points properly
-  const lines = criteria.split("\n");
-  const content = [];
-
-  for (const line of lines) {
-    const trimmedLine = line.trim();
-
-    // Skip empty lines
-    if (!trimmedLine) continue;
-
-    // Check if line is a bullet point
-    if (trimmedLine.startsWith("-") || trimmedLine.startsWith("*")) {
-      content.push({
-        type: "bulletList",
-        content: [
-          {
-            type: "listItem",
-            content: [
-              {
-                type: "paragraph",
-                content: [
-                  {
-                    type: "text",
-                    text: trimmedLine.substring(1).trim(),
-                  },
-                ],
-              },
-            ],
-          },
-        ],
-      });
-    } else {
-      // Regular paragraph
-      content.push({
-        type: "paragraph",
-        content: [
-          {
-            type: "text",
-            text: trimmedLine,
-          },
-        ],
-      });
-    }
-  }
-
-  return {
-    type: "doc",
-    version: 1,
-    content: content,
-  };
+function codeFence(text: string, min: number) {
+  const length = (text.match(/`+/g) ?? []).reduce((max, run) => Math.max(max, run.length + 1), min);
+  return "`".repeat(length);
 }
 
-/**
- * Extracts plain text from Atlassian Document Format (ADF).
- * Recursively traverses the ADF structure to extract all text content.
- *
- * @param adf - The ADF document or node to extract text from
- * @returns Plain text representation of the ADF content
- */
-export function extractTextFromAdf(adf: any): string {
-  if (!adf) {
-    return "";
-  }
-
-  // If it's a string, return it directly
-  if (typeof adf === "string") {
-    return adf;
-  }
-
-  // If it's a text node, return the text
-  if (adf.type === "text" && adf.text) {
-    return adf.text;
-  }
-
-  // If it has content array, recursively extract text from each node
-  if (Array.isArray(adf.content)) {
-    const parts: string[] = [];
-
-    for (const node of adf.content) {
-      const text = extractTextFromAdf(node);
-      if (text) {
-        parts.push(text);
+export function adfToMarkdown(value: unknown): string {
+  if (typeof value === "string") return value;
+  const node = value as AdfNode | null;
+  if (!node || typeof node !== "object") return "";
+  const parts = Array.isArray(node.content) ? node.content.map(adfToMarkdown) : [];
+  const text = parts.join("");
+  switch (node.type) {
+    case "doc":
+    case "panel":
+    case "listItem": return parts.join("\n\n");
+    case "paragraph": return text;
+    case "heading": return `${"#".repeat(Math.max(1, Math.min(6, node.attrs?.level || 1)))} ${text}`;
+    case "hardBreak": return "  \n";
+    case "rule": return "---";
+    case "mention": return node.attrs?.text ?? "";
+    case "inlineCard": return node.attrs?.url ?? "";
+    case "blockquote": return parts.join("\n\n").split("\n").map((line) => `> ${line}`).join("\n");
+    case "codeBlock": {
+      const fence = codeFence(text, 3);
+      return `${fence}${node.attrs?.language ?? ""}\n${text}\n${fence}`;
+    }
+    case "bulletList":
+    case "orderedList": return parts.map((part, index) => {
+      const prefix = node.type === "bulletList" ? "- " : `${(node.attrs?.order ?? 1) + index}. `;
+      return prefix + part.replaceAll("\n", `\n${" ".repeat(prefix.length)}`);
+    }).join("\n");
+    case "text": return (node.marks ?? []).reduce((content, mark) => {
+      if (mark.type === "strong") return `**${content}**`;
+      if (mark.type === "em") return `*${content}*`;
+      if (mark.type === "strike") return `~~${content}~~`;
+      if (mark.type === "code") {
+        const fence = codeFence(content, 1);
+        return `${fence}${content}${fence}`;
       }
-    }
-
-    // Add appropriate separators based on node types
-    if (adf.type === "paragraph" || adf.type === "heading") {
-      return parts.join("") + "\n";
-    }
-
-    if (adf.type === "bulletList" || adf.type === "orderedList") {
-      return parts.join("");
-    }
-
-    if (adf.type === "listItem") {
-      return "• " + parts.join("") + "\n";
-    }
-
-    if (adf.type === "codeBlock") {
-      return "```\n" + parts.join("") + "\n```\n";
-    }
-
-    return parts.join("");
+      if (mark.type === "link" && mark.attrs?.href) return `[${content}](${mark.attrs.href})`;
+      return content;
+    }, node.text ?? "");
+    default: return parts.join("\n");
   }
-
-  return "";
 }

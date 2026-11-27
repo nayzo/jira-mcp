@@ -11,8 +11,17 @@
         
         "AUTO_CREATE_TEST_TICKETS": "true",
 
-        "JIRA_ACCEPTANCE_CRITERIA_FIELD": "customfield_10429",
-        "JIRA_STORY_POINTS_FIELD": "customfield_10040",
+        "JIRA_DEFAULT_ASSIGNEE_ACCOUNT_ID": "",
+        "JIRA_ACCEPTANCE_CRITERIA_FIELD": "",
+        "JIRA_STORY_POINTS_FIELD": "",
+        "JIRA_STORY_READINESS_FIELD": "",
+        "JIRA_STORY_READINESS_YES_ID": "",
+        "JIRA_STORY_READINESS_NO_ID": "",
+        "JIRA_CRISIS_FIELD": "",
+        "JIRA_CRISIS_YES_ID": "",
+        "JIRA_CRISIS_NO_ID": "",
+        "JIRA_SPRINT_FIELD": "",
+        "JIRA_SPRINT_BOARD_ID": "",
         "JIRA_EPIC_LINK_FIELD": "customfield_10014",
 
         "JIRA_PRODUCT_FIELD": "customfield_10757",
@@ -29,7 +38,7 @@
         "ZAPI_BASE_URL": "https://prod-api.zephyr4jiracloud.com/connect",
         "ZAPI_ACCESS_KEY": "your_zephyr_access_key",
         "ZAPI_SECRET_KEY": "your_zephyr_secret_key",
-        "ZAPI_JWT_EXPIRE_SEC": "3600"
+        "ZAPI_ACCOUNT_ID": ""
       }
     }
   }
