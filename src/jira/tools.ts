@@ -1,1173 +1,395 @@
+import { STATUS_CODES } from "node:http";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import {
-  createJiraTicket,
-  createTicketLink,
-  searchJiraTickets,
-  updateJiraTicket,
-  addJiraComment,
-  getJiraComments,
-  getJiraTransitions,
-  transitionJiraTicket,
-  assignJiraTicket,
-  addJiraWatcher,
-  removeJiraWatcher,
-  getJiraIssueHistory,
-  addJiraWorklog,
-  getJiraRelatedIssues,
-  getJiraDevInfo,
-  getJiraBoardSprints,
-} from "./api.js";
-import {
-  formatDescription,
-  formatAcceptanceCriteria,
-  extractTextFromAdf,
-} from "./formatting.js";
-import { getJiraIssueId } from "../utils.js";
-import {
-  getZephyrTestSteps,
-  addZephyrTestStep,
-} from "../zephyr/index.js";
+import { OperationError } from "../http.js";
+import { errorDetails, skipStep, stepReport, writeStep } from "../write-steps.js";
+import { addZephyrTestStep, getJiraTestIds, getZephyrTestSteps } from "../zephyr/test-steps.js";
+import { issuePath, JiraClient, pathSegment } from "./api.js";
+import { FieldClaims, JiraFields } from "./fields.js";
+import { formatDescription, formatJiraContent } from "./formatting.js";
+import { getTicket, listWorklogs, searchFields, searchTickets } from "./reads.js";
+import { getSprints, moveToSprint, resolveSprint } from "./sprints.js";
+import { createIssue, getMyself, linkIssues, resolveAssignee, setLegacyDefaults, type IssueFields } from "./writes.js";
 
-// Check if auto-creation of test tickets is enabled (default to true)
-const autoCreateTestTickets = process.env.AUTO_CREATE_TEST_TICKETS !== "false";
+const ticket_key = z.string().min(1, "Ticket key is required");
+const issue_type = z.enum(["Bug", "Task", "Story", "Test", "Epic"]);
+const sprint_id = z.number().int().positive().safe().optional();
+const choices = z.enum(["Yes", "No"]).optional();
+const searchPage = {
+  max_results: z.number().min(1).max(50).default(10).optional(),
+  next_page_token: z.string().min(1).optional(),
+};
 
-// Register JIRA tools on the provided server instance
-export function registerJiraTools(server: McpServer) {
-  // Create ticket tool
-  server.tool(
-    "create-ticket",
-    "Create a jira ticket",
-    {
-      summary: z.string().min(1, "Summary is required"),
-      issue_type: z.enum(["Bug", "Task", "Story", "Test", "Epic"]).default("Task"),
-      description: z.string().optional(),
-      acceptance_criteria: z.string().optional(),
-      story_points: z.number().optional(),
-      create_test_ticket: z.boolean().optional(),
-      parent_epic: z.string().optional(),
-      sprint: z.string().optional(),
-      story_readiness: z.enum(["Yes", "No"]).optional(),
-      assignee: z.string().optional().describe("Account ID to assign the ticket to. Falls back to JIRA_DEFAULT_ASSIGNEE_ACCOUNT_ID env var."),
-    },
-    async ({
-      summary,
-      issue_type,
-      description,
-      acceptance_criteria,
-      story_points,
-      create_test_ticket,
-      parent_epic,
-      sprint,
-      story_readiness,
-      assignee,
-    }) => {
-      const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue`;
+function result(value: string | object, isError = false): CallToolResult {
+  return {
+    ...(isError && { isError }),
+    content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value, null, 2) }],
+  };
+}
 
-      const formattedDescription = formatDescription(description);
+function moveStep(jira: JiraClient, key: string, sprint: number) {
+  return writeStep("move ticket to sprint", {
+    rejected: "Correct the Jira Agile error, then call move-ticket-to-sprint with the ticket_key and sprint_id.",
+    uncertain: "Check the ticket's current sprint in Jira (get-ticket) before retrying. If it has not moved, call move-ticket-to-sprint only.",
+    not_attempted: "Correct the error, then call move-ticket-to-sprint with the ticket_key and sprint_id.",
+  }, () => moveToSprint(jira, key, sprint));
+}
 
-      // Determine if we should create a test ticket
-      const shouldCreateTestTicket =
-        create_test_ticket !== undefined
-          ? create_test_ticket
-          : autoCreateTestTickets;
+async function runTool(name: string, handler: () => Promise<CallToolResult>) {
+  try {
+    return await handler();
+  } catch (error) {
+    return result(errorDetails(error, name), true);
+  }
+}
 
-      // Build the payload for the main ticket
-      const payload: any = {
-        fields: {
-          project: {
-            key: process.env.JIRA_PROJECT_KEY || "SCRUM",
-          },
-          summary: summary,
-          description: formattedDescription,
-          issuetype: {
-            name: issue_type,
-          },
-        },
+export function registerTools(server: McpServer, jira: JiraClient) {
+  const fields = new JiraFields(jira);
+  const project = () => process.env.JIRA_PROJECT_KEY || "SCRUM";
+
+  function tool<S extends z.ZodRawShape>(
+    name: string, description: string, shape: S,
+    handler: (args: z.objectOutputType<S, z.ZodTypeAny>) => Promise<CallToolResult>,
+  ) {
+    server.tool<z.ZodRawShape>(name, description, shape, (args) =>
+      runTool(name, () => handler(args as z.objectOutputType<S, z.ZodTypeAny>)));
+  }
+
+  tool("create-ticket", "Create a Jira ticket", {
+    summary: z.string().min(1, "Summary is required"),
+    issue_type: issue_type.default("Task"),
+    description: z.string().optional(),
+    acceptance_criteria: z.string().optional(),
+    story_points: z.number().optional(),
+    create_test_ticket: z.boolean().optional(),
+    parent_epic: z.string().optional(),
+    sprint: z.string().optional(),
+    sprint_id,
+    story_readiness: choices,
+    project_key: z.string().optional(),
+    crisis: choices,
+    assignee: z.string().optional().describe("Atlassian account ID, me, or unassigned"),
+  }, async (args) => {
+    const { summary, issue_type, description, parent_epic, story_points } = args;
+    const projectKey = args.project_key || project();
+    const wantsSprint = args.sprint_id !== undefined || args.sprint !== undefined;
+    const wantsTest = (args.create_test_ticket ?? process.env.AUTO_CREATE_TEST_TICKETS !== "false") && issue_type === "Story" && story_points !== undefined;
+    const testProject = wantsTest ? project() : undefined;
+    let sprint = args.sprint_id;
+    const create = await writeStep("create ticket", {
+      rejected: "Correct the Jira error, then retry create-ticket.",
+      uncertain: "Search Jira for the requested issue in the target project. Do not retry creation unless you confirm it does not exist.",
+      not_attempted: "Correct the error, then retry create-ticket.",
+    }, async () => {
+      const claims = new FieldClaims();
+      sprint = await resolveSprint(jira, args.sprint_id, args.sprint);
+      const payload: IssueFields = {
+        project: { key: projectKey }, summary, description: formatDescription(description), issuetype: { name: issue_type },
       };
-
-      // Add acceptance criteria if provided
-      if (acceptance_criteria !== undefined) {
-        // Using environment variable for acceptance criteria field
-        const acceptanceCriteriaField =
-          process.env.JIRA_ACCEPTANCE_CRITERIA_FIELD || "customfield_10429";
-
-        // Format and add acceptance criteria to the custom field only, not to description
-        payload.fields[acceptanceCriteriaField] =
-          formatAcceptanceCriteria(acceptance_criteria);
-
-        // Log for debugging
-        console.error(
-          `Adding acceptance criteria to field ${acceptanceCriteriaField}`
-        );
-        console.error(
-          "Formatted acceptance criteria:",
-          JSON.stringify(formatAcceptanceCriteria(acceptance_criteria), null, 2)
-        );
-      }
-
-      // Add assignee: explicit param takes priority, then env var default
-      const assigneeId = assignee ?? process.env.JIRA_DEFAULT_ASSIGNEE_ACCOUNT_ID;
-      if (assigneeId) {
-        payload.fields.assignee = { accountId: assigneeId };
-      }
-
-      // Only add custom fields for Bug, Task, and Story issue types, not for Test or Epic
-      if (issue_type !== "Test" && issue_type !== "Epic") {
-        // Add product field if configured
-        const productField = process.env.JIRA_PRODUCT_FIELD;
-        const productValue = process.env.JIRA_PRODUCT_VALUE;
-        const productId = process.env.JIRA_PRODUCT_ID;
-
-        if (productField && productValue && productId) {
-          payload.fields[productField] = [
-            {
-              self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${productId}`,
-              value: productValue,
-              id: productId,
-            },
-          ];
-        }
-
-        // Add category field if configured
-        const categoryField = process.env.JIRA_CATEGORY_FIELD;
-
-        if (categoryField) {
-          const useAlternateCategory =
-            process.env.USE_ALTERNATE_CATEGORY === "true";
-
-          const categoryOptionId = useAlternateCategory
-            ? process.env.JIRA_ALTERNATE_CATEGORY_ID
-            : process.env.JIRA_DEFAULT_CATEGORY_ID;
-
-          const categoryOptionValue = useAlternateCategory
-            ? process.env.JIRA_ALTERNATE_CATEGORY_VALUE
-            : process.env.JIRA_DEFAULT_CATEGORY_VALUE;
-
-          if (categoryOptionId && categoryOptionValue) {
-            payload.fields[categoryField] = {
-              self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${categoryOptionId}`,
-              value: categoryOptionValue,
-              id: categoryOptionId,
-            };
-          }
-        }
-      }
-
-      // Add story points if provided and field is configured
-      if (story_points !== undefined && issue_type === "Story") {
-        const storyPointsField = process.env.JIRA_STORY_POINTS_FIELD;
-        if (storyPointsField) {
-          payload.fields[storyPointsField] = story_points;
-          payload.fields.labels = ["QA-Testable"];
-        }
-      }
-
-      // Add parent if provided (Jira hierarchy: Story under Epic, Task under Epic, etc.)
+      if (issue_type === "Bug" || issue_type === "Task" || issue_type === "Story") setLegacyDefaults(payload);
+      Object.assign(payload, await fields.forWrite(args, { projectKey, issueType: issue_type }, claims));
+      if (issue_type === "Story" && story_points !== undefined) payload.labels = ["QA-Testable"];
       if (parent_epic !== undefined) {
-        payload.fields.parent = { key: parent_epic };
+        if (issue_type === "Epic") payload.parent = { key: parent_epic };
+        else payload[claims.claim(process.env.JIRA_EPIC_LINK_FIELD?.trim() || "customfield_10014", "JIRA_EPIC_LINK_FIELD")] = parent_epic;
       }
-
-      // Add sprint if provided
-      if (sprint !== undefined) {
-        // Sprint field is customfield_10020 based on our query
-        payload.fields["customfield_10020"] = [
-          {
-            name: sprint,
-          },
-        ];
-      }
-
-      // Add story readiness if provided and field is configured
-      if (story_readiness !== undefined) {
-        const storyReadinessField = process.env.JIRA_STORY_READINESS_FIELD;
-        const storyReadinessYesId = process.env.JIRA_STORY_READINESS_YES_ID;
-        const storyReadinessNoId = process.env.JIRA_STORY_READINESS_NO_ID;
-        if (storyReadinessField && storyReadinessYesId && storyReadinessNoId) {
-          const storyReadinessId = story_readiness === "Yes" ? storyReadinessYesId : storyReadinessNoId;
-          payload.fields[storyReadinessField] = {
-            self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${storyReadinessId}`,
-            value: story_readiness,
-            id: storyReadinessId,
-          };
-        }
-      }
-
-      // Create the auth token
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
-
-      // Create the main ticket
-      const result = await createJiraTicket(payload, auth);
-
-      if (!result.success) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error creating ticket: ${result.errorMessage}`,
-          },
-        ],
-      };
-      }
-
-      // Extract the ticket key/number from the response
-      const ticketKey = result.data.key;
-      let responseText = `Created ticket ${ticketKey} with summary: ${summary}, description: ${
-        description || "No description"
-      }, issue type: ${issue_type}`;
-
-      if (acceptance_criteria !== undefined) {
-        responseText += `, acceptance criteria: ${acceptance_criteria}`;
-      }
-
-      if (story_points !== undefined) {
-        responseText += `, story points: ${story_points}`;
-      }
-
-      // Create a test ticket if this is a Story with points, field is configured, and auto-creation is enabled
-      if (
-        shouldCreateTestTicket &&
-        issue_type === "Story" &&
-        story_points !== undefined &&
-        process.env.JIRA_STORY_POINTS_FIELD &&
-        ticketKey
-      ) {
-        // Create a test ticket linked to the story
-        const testTicketPayload: any = {
-          fields: {
-            project: {
-              key: process.env.JIRA_PROJECT_KEY || "SCRUM",
-            },
-            summary: `${ticketKey} ${summary}`,
-            description: formatDescription(summary), // Use story title as description
-            issuetype: {
-              name: "Test",
-            },
-            // Don't include custom fields for Test issue type as they may not be available
-          },
-        };
-
-        // Create the test ticket
-        const testResult = await createJiraTicket(testTicketPayload, auth);
-
-        if (testResult.success && testResult.data.key) {
-          // Link the test ticket to the story
-          const linkResult = await createTicketLink(
-            ticketKey,
-            testResult.data.key,
-            "Test Case Linking", // "is tested by" relationship
-            auth
-          );
-
-          if (linkResult.success) {
-            responseText += `\nCreated linked test ticket ${testResult.data.key}`;
-          } else {
-            responseText += `\nCreated test ticket ${testResult.data.key} but failed to link it: ${linkResult.errorMessage}`;
-          }
-        } else {
-          responseText += `\nFailed to create test ticket: ${testResult.errorMessage}`;
-        }
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: responseText,
-          },
-        ],
-      };
+      const assignee = args.assignee ?? (process.env.JIRA_DEFAULT_ASSIGNEE_ACCOUNT_ID?.trim() || undefined);
+      if (assignee !== undefined) payload.assignee = { accountId: await resolveAssignee(jira, assignee) };
+      return createIssue(jira, payload);
+    });
+    const task = create.state === "done" ? create.value : undefined;
+    const key = task?.key;
+    if (!wantsSprint && !wantsTest && task) {
+      let message = `Created ticket ${task.key} with summary: ${summary}, description: ${description || "No description"}, issue type: ${issue_type}`;
+      if (args.acceptance_criteria !== undefined) message += `, acceptance criteria: ${args.acceptance_criteria}`;
+      if (story_points !== undefined) message += `, story points: ${story_points}`;
+      if (task.omittedFields.length) message += `\nWarning: Jira rejected optional fields; omitted: ${task.omittedFields.join(", ")}`;
+      return result(message);
     }
-  );
+    const afterCreate = "Once the ticket key is confirmed, resume only this step; do not recreate the issue.";
+    const move = wantsSprint && key && sprint !== undefined ? await moveStep(jira, key, sprint) : undefined;
+    const createTest = testProject && key ? await writeStep("create test ticket", {
+      rejected: "Correct the Jira error, use create-ticket for the Test only, then link it to the existing Story using link-tickets.",
+      uncertain: "Search for the Test ticket (its summary begins with the Story key); create it only if confirmed absent, then link it to the Story.",
+      not_attempted: "Correct the error, use create-ticket for the Test only, then link it to the existing Story using link-tickets.",
+    }, () => createIssue(jira, {
+      project: { key: testProject }, summary: `${key} ${summary}`, description: formatDescription(summary), issuetype: { name: "Test" },
+    }, "create test ticket")) : undefined;
+    const test = createTest?.state === "done" ? createTest.value : undefined;
+    const link = key && test ? await writeStep("link test ticket", {
+      rejected: "Correct the Jira error, then call link-tickets with the two known keys and link_type 'Test Case Linking'.",
+      uncertain: "Check issue links before retrying. If the link does not exist, call link-tickets with the two known keys.",
+      not_attempted: "Correct the error, then call link-tickets with the two known keys.",
+    }, () => linkIssues(jira, key, test.key, "Test Case Linking", "link test ticket")) : undefined;
 
-  // Link tickets tool
-  server.tool(
-    "link-tickets",
-    "Link two jira tickets",
-    {
-      outward_issue: z.string().min(1, "Outward issue key is required"),
-      inward_issue: z.string().min(1, "Inward issue key is required"),
-      link_type: z
-        .string()
-        .min(1, "Link type is required")
-        .default("Test Case Linking"),
-    },
-    async ({ outward_issue, inward_issue, link_type }) => {
-      // Create the auth token
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
+    return result({
+      ticket_key: key, project_key: projectKey, sprint_id: sprint, sprint: args.sprint, test_ticket_key: test?.key, test_project_key: testProject,
+      steps: {
+        create_ticket: { ...stepReport(create), omitted_fields: task?.omittedFields.length ? task.omittedFields : undefined },
+        move_to_sprint: move ? stepReport(move) : skipStep(wantsSprint ? "Ticket or sprint could not be confirmed" : "No sprint requested",
+          wantsSprint ? `${afterCreate} Resolve the sprint and call move-ticket-to-sprint.` : undefined),
+        create_test_ticket: createTest ? { ...stepReport(createTest), omitted_fields: test?.omittedFields.length ? test.omittedFields : undefined }
+          : skipStep(wantsTest ? "Story key not confirmed" : "No linked Test requested", wantsTest ? afterCreate : undefined),
+        link_test_ticket: link ? stepReport(link) : skipStep(wantsTest ? "Story or Test key not confirmed" : "No linked Test requested",
+          wantsTest ? "Once both keys are confirmed, call link-tickets with link_type 'Test Case Linking'." : undefined),
+      },
+    }, create.state !== "done" || (wantsSprint && move?.state !== "done") || (wantsTest && link?.state !== "done"));
+  });
 
-      // Create the link
-      const result = await createTicketLink(
-        outward_issue,
-        inward_issue,
-        link_type,
-        auth
-      );
-
-      if (!result.success) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Error linking tickets: ${result.errorMessage}`,
-          },
-        ],
-      };
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Successfully linked ${outward_issue} to ${inward_issue} with link type "${link_type}"`,
-          },
-        ],
-      };
+  tool("update-ticket", "Update an existing Jira ticket", {
+    ticket_key,
+    summary: z.string().min(1).optional(),
+    description: z.string().min(1).optional().describe("Replaces the whole description. Markdown is converted to ADF"),
+    sprint: z.string().optional(),
+    sprint_id,
+    story_readiness: choices,
+    story_points: z.number().optional(),
+    acceptance_criteria: z.string().optional(),
+    crisis: choices,
+  }, async (args) => {
+    const { ticket_key, summary, description } = args;
+    const wantsSprint = args.sprint_id !== undefined || args.sprint !== undefined;
+    const wantsUpdate = [summary, description, args.story_points, args.story_readiness, args.acceptance_criteria, args.crisis]
+      .some((value) => value !== undefined);
+    if (!wantsUpdate && !wantsSprint) throw new OperationError("At least one field or sprint to update must be provided");
+    let sprint = args.sprint_id;
+    let payload: IssueFields;
+    try {
+      const claims = new FieldClaims();
+      sprint = await resolveSprint(jira, sprint, args.sprint);
+      payload = await fields.forWrite(args, { ticketKey: ticket_key }, claims);
+      if (summary !== undefined) payload.summary = summary;
+      if (description !== undefined) payload.description = formatDescription(description);
+    } catch (error) {
+      return result({ ticket_key, sprint_id: sprint, sprint: args.sprint, ...errorDetails(error, "prepare ticket update"), steps: {
+        update_ticket: skipStep(wantsUpdate ? "Validation or preparation failed" : "No issue fields requested"),
+        move_to_sprint: skipStep(wantsSprint ? "Validation or preparation failed" : "No sprint requested"),
+      }, recovery: "Correct the error, then retry update-ticket." }, true);
     }
-  );
+    const update = wantsUpdate ? await writeStep("update ticket", {
+      rejected: "Correct the Jira error, then retry the update.",
+      uncertain: "Check the ticket's fields before retrying. Apply only changes that were not saved; the sprint move was not attempted.",
+      not_attempted: "Correct the error, then retry the update.",
+    }, () => jira.put("update ticket", issuePath(ticket_key), { fields: payload })) : undefined;
+    const move = sprint !== undefined && (!update || update.state === "done") ? await moveStep(jira, ticket_key, sprint) : undefined;
+    if (!wantsSprint && update?.state === "done") return result(`Successfully updated ticket ${ticket_key}`);
+    return result({ ticket_key, sprint_id: sprint, sprint: args.sprint, steps: {
+      update_ticket: update ? stepReport(update) : skipStep("No issue fields requested"),
+      move_to_sprint: move ? stepReport(move) : skipStep(wantsSprint ? "Issue update was not confirmed" : "No sprint requested",
+        wantsSprint ? "Once the issue fields are correct, call move-ticket-to-sprint separately." : undefined),
+    } }, (wantsUpdate && update?.state !== "done") || (wantsSprint && move?.state !== "done"));
+  });
 
-  // Get ticket tool
-  server.tool(
-    "get-ticket",
-    "Get a jira ticket",
-    {
-      ticket_id: z.string().min(1, "Ticket ID is required"),
-    },
-    async ({ ticket_id }) => {
-      const jiraUrl = `https://${process.env.JIRA_HOST}/rest/api/3/issue/${ticket_id}`;
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
+  tool("get-ticket", "Get compact Jira ticket details or the full Jira fields with raw: true", {
+    ticket_id: z.string().min(1, "Ticket ID is required"), raw: z.boolean().optional(),
+  }, async ({ ticket_id, raw }) => result(await getTicket(jira, fields, ticket_id, raw)));
 
-      try {
-        const response = await fetch(jiraUrl, {
-          method: "GET",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Basic ${auth}`,
-          },
-        });
+  tool("search-tickets", "Search for Jira tickets by issue type", {
+    issue_type, ...searchPage, additional_criteria: z.string().optional(),
+  }, async ({ issue_type, max_results = 10, additional_criteria, next_page_token }) => {
+    let jql = `project = ${JSON.stringify(project())} AND issuetype = "${issue_type}"`;
+    if (additional_criteria) jql += ` AND (${additional_criteria})`;
+    return result(await searchTickets(jira, jql, max_results, "summary,status,priority", next_page_token));
+  });
 
-        const responseData = (await response.json()) as {
-          id?: string;
-          errorMessages?: string[];
-          fields?: {
-            project?: {
-              id?: string;
-            };
-          };
-        };
+  tool("search-tickets-jql", "Search for Jira tickets using custom JQL", {
+    jql: z.string().min(1, "JQL query is required"), ...searchPage,
+    fields: z.string().optional().describe("Comma-separated list of fields, or *all. Omit for the compact default fields."),
+  }, async ({ jql, max_results = 10, fields, next_page_token }) =>
+    result(await searchTickets(jira, jql, max_results, fields?.trim() || searchFields, next_page_token)));
 
-        if (!response.ok) {
-          console.error("Error fetching ticket:", responseData);
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `Error fetching ticket: ${
-                  responseData.errorMessages?.join(", ") || "Unknown error"
-                }`,
-              },
-            ],
-          };
-        }
+  tool("link-tickets", "Link two Jira tickets", {
+    outward_issue: z.string().min(1, "Outward issue key is required"),
+    inward_issue: z.string().min(1, "Inward issue key is required"),
+    link_type: z.string().min(1, "Link type is required").default("Test Case Linking"),
+  }, async ({ outward_issue, inward_issue, link_type }) => {
+    await linkIssues(jira, outward_issue, inward_issue, link_type);
+    return result(`Successfully linked ${outward_issue} to ${inward_issue} with link type "${link_type}"`);
+  });
 
-        if (!responseData.fields) {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: "Error: No ticket fields found in response",
-              },
-            ],
-          };
-        }
+  tool("remove-issue-link", "Remove a link between two Jira tickets by link ID", {
+    link_id: z.string().min(1, "Link ID is required"),
+  }, async ({ link_id }) => {
+    await jira.delete("remove issue link", `/rest/api/3/issueLink/${pathSegment(link_id)}`);
+    return result(`Link ${link_id} removed successfully`);
+  });
 
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `JIRA Ticket: ${ticket_id}, Fields: ${JSON.stringify(
-                responseData.fields,
-                null,
-                2
-              )}`,
-            },
-          ],
-        };
-      } catch (error) {
-        console.error("Exception fetching ticket:", error);
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error fetching ticket: ${
-                error instanceof Error ? error.message : String(error)
-              }`,
-            },
-          ],
-        };
-      }
+  const comment_id = z.string().min(1, "Comment ID is required");
+  tool("add-comment", "Add a comment to a Jira ticket", {
+    ticket_key, body: z.string().min(1, "Comment body is required"),
+  }, async ({ ticket_key, body }) => {
+    const comment = await jira.post<{ id?: string }>("add comment", `${issuePath(ticket_key)}/comment`, { body: formatJiraContent(body) });
+    if (!comment?.id) throw new OperationError("add comment: Jira did not return an ID; check the comments before retrying");
+    return result(`Comment added successfully to ${ticket_key} (id: ${comment.id})`);
+  });
+
+  tool("edit-comment", "Edit an existing comment on a Jira ticket", {
+    ticket_key, comment_id, body: z.string().min(1, "New comment body is required"),
+  }, async ({ ticket_key, comment_id, body }) => {
+    await jira.put("edit comment", `${issuePath(ticket_key)}/comment/${pathSegment(comment_id)}`, { body: formatJiraContent(body) });
+    return result(`Comment ${comment_id} on ${ticket_key} updated successfully`);
+  });
+
+  tool("delete-comment", "Delete a comment from a Jira ticket. This cannot be undone", {
+    ticket_key, comment_id,
+  }, async ({ ticket_key, comment_id }) => {
+    await jira.delete("delete comment", `${issuePath(ticket_key)}/comment/${pathSegment(comment_id)}`);
+    return result(`Comment ${comment_id} on ${ticket_key} deleted successfully`);
+  });
+
+  tool("get-sprints", "List sprints for a Jira board", {
+    board_id: z.number().int().positive().safe(),
+    state: z.enum(["active", "future", "closed"]).optional().describe("Filter by sprint state (default: active)"),
+  }, async ({ board_id, state = "active" }) => result({ board_id, state, sprints: await getSprints(jira, board_id, state) }));
+
+  tool("move-ticket-to-sprint", "Move a Jira ticket to an active or future sprint", {
+    ticket_key, sprint_id: sprint_id.unwrap(),
+  }, async ({ ticket_key, sprint_id }) => result(await moveToSprint(jira, ticket_key, sprint_id)));
+
+  tool("transition-ticket", "List or apply a Jira ticket workflow transition", {
+    ticket_key,
+    transition_name: z.string().optional(),
+    transition_id: z.string().optional(),
+    list_transitions: z.boolean().optional(),
+    comment: z.string().optional(),
+  }, async ({ ticket_key, transition_name, transition_id, list_transitions, comment }) => {
+    const path = `${issuePath(ticket_key)}/transitions`;
+    const page = await jira.get<{ transitions: { id: string; name: string; to: { name: string }; fields?: Record<string, { required?: boolean }> }[] }>(
+      "list ticket transitions", path, { expand: "transitions.fields" },
+    );
+    if (!Array.isArray(page?.transitions)) throw new OperationError("list ticket transitions: no transitions returned by Jira");
+    const transitions = page.transitions.map(({ id, name, to, fields }) => ({
+      id, name, to: to.name, required_fields: Object.entries(fields ?? {}).filter(([, field]) => field.required).map(([key]) => key),
+    }));
+    const name = transition_name?.trim().toLowerCase();
+    if (transition_id !== undefined && name !== undefined && !transitions.some((t) => t.id === transition_id && t.name.toLowerCase() === name)) {
+      return result({ operation: "transition-ticket", ticket_key, error: "transition_id and transition_name do not identify the same available transition", transitions }, true);
     }
-  );
+    if (list_transitions || (transition_id === undefined && transition_name === undefined)) return result({ ticket_key, transitions });
+    const matches = transitions.filter((t) => transition_id !== undefined ? t.id === transition_id : t.name.toLowerCase() === name);
+    if (matches.length !== 1) return result({
+      operation: "transition-ticket", ticket_key, error: matches.length ? "Transition name is ambiguous; use transition_id" : "Transition is not available",
+      transitions: matches.length ? matches : transitions,
+    }, true);
+    const [target] = matches;
+    const applied = await writeStep("apply ticket transition", {
+      rejected: "Correct the Jira error and recheck available transitions before retrying.",
+      uncertain: "Check the current Jira status and any transition comment before retrying the transition.",
+      not_attempted: "Correct the error and recheck available transitions before retrying.",
+    }, () => jira.command("apply ticket transition", path, {
+      transition: { id: target.id },
+      ...(comment && { update: { comment: [{ add: { body: formatJiraContent(comment) } }] } }),
+    }));
+    const identity = { ticket_key, transition_id: target.id };
+    if (applied.state !== "done") return result({ ...identity, transition: stepReport(applied) }, true);
 
-  // Search tickets tool
-  server.tool(
-    "search-tickets",
-    "Search for jira tickets by issue type",
-    {
-      issue_type: z.enum(["Bug", "Task", "Story", "Test", "Epic"]),
-      max_results: z.number().min(1).max(50).default(10).optional(),
-      additional_criteria: z.string().optional(), // For additional JQL criteria
-    },
-    async ({ issue_type, max_results = 10, additional_criteria }) => {
-      // Create the auth token
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
-
-      // Construct the JQL query
-      let jql = `project = "${process.env.JIRA_PROJECT_KEY}" AND issuetype = "${issue_type}"`;
-
-      // Add additional criteria if provided
-      if (additional_criteria) {
-        jql += ` AND (${additional_criteria})`;
-      }
-
-      // Search for tickets
-      const result = await searchJiraTickets(jql, max_results, auth);
-
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error searching tickets: ${result.errorMessage}`,
-            },
-          ],
-        };
-      }
-
-      // Check if we have results
-      if (!result.data.issues || result.data.issues.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `No ${issue_type} tickets found matching the criteria.`,
-            },
-          ],
-        };
-      }
-
-      // Format the results
-      const tickets = result.data.issues.map((issue) => ({
-        key: issue.key,
-        summary: issue.fields.summary,
-        status: issue.fields.status?.name || "Unknown",
-        priority: issue.fields.priority?.name || "Unknown",
-      }));
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Found ${result.data.total} ${issue_type} tickets (showing ${
-              tickets.length
-            }):\n\n${JSON.stringify(tickets, null, 2)}`,
-          },
-        ],
-      };
+    const operation = "read status after transition";
+    try {
+      const issue = await jira.get<{ fields?: { status?: { name?: string } } }>(operation, issuePath(ticket_key), { fields: "status" });
+      const status = issue?.fields?.status?.name;
+      if (!status) throw new OperationError("Jira did not return the current status");
+      return result({ ...identity, status });
+    } catch (error) {
+      return result({ ...identity, transition: stepReport(applied), ...errorDetails(error, operation),
+        recovery: "The transition was accepted. Read the ticket status again; do not repeat the transition." }, true);
     }
-  );
+  });
 
-  // Update ticket tool (enhanced with additional fields)
-  server.tool(
-    "update-ticket",
-    "Update an existing jira ticket with various fields",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      summary: z.string().optional(),
-      description: z.string().optional(),
-      acceptance_criteria: z.string().optional(),
-      story_points: z.number().optional(),
-      sprint: z.string().optional(),
-      story_readiness: z.enum(["Yes", "No"]).optional(),
-      assignee: z.string().optional().describe("Account ID or 'unassigned' to remove assignee"),
-      priority: z.enum(["Highest", "High", "Medium", "Low", "Lowest"]).optional(),
-      labels: z.array(z.string()).optional().describe("Replaces existing labels"),
-      components: z.array(z.string()).optional().describe("Component names"),
-      fix_versions: z.array(z.string()).optional().describe("Fix version names"),
-      due_date: z.string().optional().describe("Due date in YYYY-MM-DD format"),
-    },
-    async ({
-      ticket_key,
-      summary,
-      description,
-      acceptance_criteria,
-      story_points,
-      sprint,
-      story_readiness,
-      assignee,
-      priority,
-      labels,
-      components,
-      fix_versions,
-      due_date,
-    }) => {
-      // Create the auth token
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
+  server.tool("get-myself", "Get the current Jira user's account ID and display name", () =>
+    runTool("get-myself", async () => result(await getMyself(jira))));
 
-      // Build the payload for the update
-      const payload: any = {
-        fields: {},
-      };
+  tool("assign-ticket", "Assign or unassign a Jira ticket", {
+    ticket_key, assignee: z.string().describe("Atlassian account ID, me, or unassigned"),
+  }, async ({ ticket_key, assignee }) => {
+    const accountId = await resolveAssignee(jira, assignee);
+    await jira.put("assign ticket", `${issuePath(ticket_key)}/assignee`, { accountId });
+    return result({ ticket_key, accountId });
+  });
 
-      // Add summary if provided
-      if (summary !== undefined) {
-        payload.fields.summary = summary;
-      }
-
-      // Add description if provided
-      if (description !== undefined) {
-        payload.fields.description = formatDescription(description);
-      }
-
-      // Add acceptance criteria if provided
-      if (acceptance_criteria !== undefined) {
-        const acceptanceCriteriaField =
-          process.env.JIRA_ACCEPTANCE_CRITERIA_FIELD || "customfield_10429";
-        payload.fields[acceptanceCriteriaField] =
-          formatAcceptanceCriteria(acceptance_criteria);
-      }
-
-      // Add story points if provided
-      if (story_points !== undefined) {
-        const storyPointsField =
-          process.env.JIRA_STORY_POINTS_FIELD || "customfield_10040";
-        payload.fields[storyPointsField] = story_points;
-      }
-
-      // Add sprint if provided
-      if (sprint !== undefined) {
-        payload.fields["customfield_10020"] = [{ name: sprint }];
-      }
-
-      // Add story readiness if provided
-      if (story_readiness !== undefined) {
-        const storyReadinessId = story_readiness === "Yes" ? "18256" : "18257";
-        payload.fields["customfield_10596"] = {
-          self: `https://${process.env.JIRA_HOST}/rest/api/3/customFieldOption/${storyReadinessId}`,
-          value: story_readiness,
-          id: storyReadinessId,
-        };
-      }
-
-      // Add assignee if provided
-      if (assignee !== undefined) {
-        payload.fields.assignee =
-          assignee === "unassigned" ? null : { accountId: assignee };
-      }
-
-      // Add priority if provided
-      if (priority !== undefined) {
-        payload.fields.priority = { name: priority };
-      }
-
-      // Add labels if provided
-      if (labels !== undefined) {
-        payload.fields.labels = labels;
-      }
-
-      // Add components if provided
-      if (components !== undefined) {
-        payload.fields.components = components.map((name) => ({ name }));
-      }
-
-      // Add fix versions if provided
-      if (fix_versions !== undefined) {
-        payload.fields.fixVersions = fix_versions.map((name) => ({ name }));
-      }
-
-      // Add due date if provided
-      if (due_date !== undefined) {
-        payload.fields.duedate = due_date;
-      }
-
-      // If no fields were provided, return an error
-      if (Object.keys(payload.fields).length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "Error: At least one field to update must be provided.",
-            },
-          ],
-        };
-      }
-
-      // Update the ticket
-      const result = await updateJiraTicket(ticket_key, payload, auth);
-
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error updating ticket: ${result.errorMessage}`,
-            },
-          ],
-        };
-      }
-
-      // Build response text
-      const updatedFields: string[] = [];
-      if (summary !== undefined) updatedFields.push("summary");
-      if (description !== undefined) updatedFields.push("description");
-      if (acceptance_criteria !== undefined) updatedFields.push("acceptance_criteria");
-      if (story_points !== undefined) updatedFields.push(`story_points: ${story_points}`);
-      if (sprint !== undefined) updatedFields.push(`sprint: ${sprint}`);
-      if (story_readiness !== undefined) updatedFields.push(`story_readiness: ${story_readiness}`);
-      if (assignee !== undefined) updatedFields.push(`assignee: ${assignee}`);
-      if (priority !== undefined) updatedFields.push(`priority: ${priority}`);
-      if (labels !== undefined) updatedFields.push(`labels: [${labels.join(", ")}]`);
-      if (components !== undefined) updatedFields.push(`components: [${components.join(", ")}]`);
-      if (fix_versions !== undefined) updatedFields.push(`fix_versions: [${fix_versions.join(", ")}]`);
-      if (due_date !== undefined) updatedFields.push(`due_date: ${due_date}`);
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Successfully updated ticket ${ticket_key}: ${updatedFields.join(", ")}`,
-          },
-        ],
-      };
+  tool("add-worklog", "Log time on a Jira ticket using a duration in seconds or Jira duration text", {
+    ticket_key,
+    time_spent: z.string().min(1).optional().describe("Jira duration, e.g. 2h 30m or 1d"),
+    time_spent_seconds: z.number().int().positive().safe().optional(),
+    started: z.string().datetime({ offset: true }).refine((date) => Number.isFinite(Date.parse(date)), "Invalid timestamp")
+      .optional().describe("ISO 8601 timestamp with a timezone"),
+    comment: z.string().optional(),
+  }, async ({ ticket_key, time_spent, time_spent_seconds, started, comment }) => {
+    if ((time_spent === undefined) === (time_spent_seconds === undefined) || (time_spent !== undefined && !time_spent.trim())) {
+      throw new OperationError("Provide exactly one non-empty time_spent or positive time_spent_seconds");
     }
-  );
+    const log = await jira.post<{ id?: string; started?: string; timeSpentSeconds?: number; timeSpent?: string }>(
+      "add worklog", `${issuePath(ticket_key)}/worklog`, {
+        timeSpent: time_spent, timeSpentSeconds: time_spent_seconds,
+        started: started && new Date(started).toISOString().replace(/Z$/, "+0000"),
+        ...(comment && { comment: formatJiraContent(comment) }),
+      },
+    );
+    if (!log?.id) throw new OperationError("add worklog: Jira did not return an ID; check the worklogs before retrying");
+    return result({ ticket_key, id: log.id, started: log.started, timeSpentSeconds: log.timeSpentSeconds, timeSpent: log.timeSpent });
+  });
 
-  // Add comment tool
-  server.tool(
-    "add-comment",
-    "Add a comment to a JIRA ticket",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      comment: z.string().min(1, "Comment text is required"),
-    },
-    async ({ ticket_key, comment }) => {
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
+  tool("list-worklogs", "List one page of worklogs on a Jira ticket", {
+    ticket_key, start_at: z.number().int().nonnegative().safe().optional(), max_results: z.number().int().min(1).max(100).optional(),
+  }, async ({ ticket_key, start_at = 0, max_results = 20 }) => result(await listWorklogs(jira, ticket_key, start_at, max_results)));
 
-      const commentBody = formatDescription(comment);
-      const result = await addJiraComment(ticket_key, commentBody, auth);
+  tool("get-test-steps", "Get test steps from a test ticket via Zephyr integration", { ticket_key }, async ({ ticket_key }) => {
+    const { issueId, projectId } = await getJiraTestIds(jira, ticket_key);
+    const steps = await getZephyrTestSteps(issueId, projectId);
+    return result(steps.length ? `Found ${steps.length} test step(s) for ticket ${ticket_key}:\n\n${JSON.stringify(steps, null, 2)}`
+      : `No test steps found for ticket ${ticket_key}.`);
+  });
 
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error adding comment: ${result.errorMessage}`,
-            },
-          ],
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Successfully added comment to ${ticket_key}`,
-          },
-        ],
-      };
+  tool("add-test-steps", "Add test steps to a test ticket via Zephyr integration", {
+    ticket_key,
+    steps: z.array(z.object({
+      step: z.string().min(1, "Step description is required"), data: z.string().optional(), result: z.string().optional(),
+    })).min(1, "At least one test step is required"),
+  }, async ({ ticket_key, steps }) => {
+    const batchResult = (text: string, details: object, failed: boolean) => {
+      const response = result(text, failed);
+      response.content.push({ type: "text", text: JSON.stringify({ ticket_key, ...details }, null, 2) });
+      return response;
+    };
+    let ids: Awaited<ReturnType<typeof getJiraTestIds>>;
+    try {
+      ids = await getJiraTestIds(jira, ticket_key);
+    } catch (error) {
+      const details = errorDetails(error, "resolve Jira test ticket IDs");
+      return batchResult(`Error getting internal ID for ticket ${ticket_key}: ${details.error}`, {
+        ...details,
+        steps: steps.map((_, index) => ({ step: index + 1, ...skipStep("Issue and project IDs could not be resolved",
+          "Correct the Jira error, then retry the batch; no step was sent.") })),
+      }, true);
     }
-  );
-
-  // List comments tool
-  server.tool(
-    "list-comments",
-    "List comments on a JIRA ticket",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      max_results: z.number().min(1).max(100).default(20).optional(),
-    },
-    async ({ ticket_key, max_results = 20 }) => {
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
-
-      const result = await getJiraComments(ticket_key, max_results, auth);
-
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error getting comments: ${result.errorMessage}`,
-            },
-          ],
-        };
+    const results: string[] = [];
+    const reports = [];
+    let stop = false;
+    for (const [index, step] of steps.entries()) {
+      if (stop) {
+        results.push(`Step ${index + 1}: Not attempted`);
+        reports.push({ step: index + 1, ...skipStep("Stopped after an earlier step was not confirmed",
+          "Resolve the earlier step first, then submit only remaining steps that are missing from Zephyr.") });
+        continue;
       }
-
-      const comments = result.data?.comments || [];
-      if (comments.length === 0) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `No comments found on ${ticket_key}`,
-            },
-          ],
-        };
-      }
-
-      const formattedComments = comments.map((c) => ({
-        id: c.id,
-        author: c.author.displayName,
-        created: c.created,
-        body: extractTextFromAdf(c.body).trim(),
-      }));
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Found ${result.data?.total || comments.length} comments on ${ticket_key}:\n\n${JSON.stringify(formattedComments, null, 2)}`,
-          },
-        ],
-      };
-    }
-  );
-
-  // Transition ticket tool
-  server.tool(
-    "transition-ticket",
-    "Transition a JIRA ticket to a different status",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      transition_name: z.string().optional().describe("Transition name (e.g., 'Done', 'In Progress')"),
-      transition_id: z.string().optional().describe("Transition ID (use if name is ambiguous)"),
-      list_transitions: z.boolean().optional().describe("List available transitions instead of transitioning"),
-      comment: z.string().optional().describe("Comment to add during the transition"),
-    },
-    async ({ ticket_key, transition_name, transition_id, list_transitions, comment }) => {
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
-
-      // Get available transitions
-      const transitionsResult = await getJiraTransitions(ticket_key, auth);
-
-      if (!transitionsResult.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error getting transitions: ${transitionsResult.errorMessage}`,
-            },
-          ],
-        };
-      }
-
-      const transitions = transitionsResult.data?.transitions || [];
-
-      // If list_transitions is true, just return the available transitions
-      if (list_transitions) {
-        const transitionList = transitions.map((t) => ({
-          id: t.id,
-          name: t.name,
-          to: t.to.name,
-        }));
-
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Available transitions for ${ticket_key}:\n\n${JSON.stringify(transitionList, null, 2)}`,
-            },
-          ],
-        };
-      }
-
-      // Find the transition by ID or name
-      let targetTransition;
-      if (transition_id) {
-        targetTransition = transitions.find((t) => t.id === transition_id);
-      } else if (transition_name) {
-        targetTransition = transitions.find(
-          (t) => t.name.toLowerCase() === transition_name.toLowerCase()
-        );
+      const added = await writeStep("add Zephyr test step", {
+        rejected: "Correct the Zephyr error, then submit only the rejected step; check its position in the step order.",
+        uncertain: "Call get-test-steps and check the saved steps and their order before retrying. Do not replay the batch.",
+        not_attempted: "Correct the error, then submit only the steps that were not attempted.",
+      }, () => addZephyrTestStep(ids.issueId, ids.projectId, step));
+      reports.push({ step: index + 1, ...stepReport(added) });
+      if (added.state === "done") {
+        results.push(`Step ${index + 1}: Added successfully`);
+      } else if (added.state === "rejected" && added.status !== undefined) {
+        results.push(`Step ${index + 1}: Failed - Status: ${added.status} ${STATUS_CODES[added.status] ?? ""}`.trimEnd());
       } else {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: "Error: Either transition_name or transition_id is required (or use list_transitions to see available options)",
-            },
-          ],
-        };
+        stop = true;
+        results.push(`Step ${index + 1}: ${added.state === "uncertain" ? "Outcome uncertain" : "Not attempted"} - ${added.error}`);
       }
-
-      if (!targetTransition) {
-        const availableNames = transitions.map((t) => `"${t.name}" (id: ${t.id})`).join(", ");
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error: Transition not found. Available transitions: ${availableNames}`,
-            },
-          ],
-        };
-      }
-
-      // Execute the transition
-      const commentBody = comment ? formatDescription(comment) : undefined;
-      const result = await transitionJiraTicket(
-        ticket_key,
-        targetTransition.id,
-        commentBody,
-        auth
-      );
-
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error transitioning ticket: ${result.errorMessage}`,
-            },
-          ],
-        };
-      }
-
-      let responseText = `Successfully transitioned ${ticket_key} to "${targetTransition.to.name}"`;
-      if (comment) {
-        responseText += " with comment";
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: responseText,
-          },
-        ],
-      };
     }
-  );
-
-  // Assign ticket tool
-  server.tool(
-    "assign-ticket",
-    "Assign or unassign a JIRA ticket",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      account_id: z.string().optional().describe("Account ID to assign to. Omit to unassign."),
-    },
-    async ({ ticket_key, account_id }) => {
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
-
-      const result = await assignJiraTicket(
-        ticket_key,
-        account_id || null,
-        auth
-      );
-
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error assigning ticket: ${result.errorMessage}`,
-            },
-          ],
-        };
-      }
-
-      const action = account_id ? `assigned to ${account_id}` : "unassigned";
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Successfully ${action} ticket ${ticket_key}`,
-          },
-        ],
-      };
-    }
-  );
-
-  // Add watcher tool
-  server.tool(
-    "add-watcher",
-    "Add a watcher to a JIRA ticket",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      account_id: z.string().min(1, "Account ID is required"),
-    },
-    async ({ ticket_key, account_id }) => {
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
-
-      const result = await addJiraWatcher(ticket_key, account_id, auth);
-
-      if (!result.success) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error adding watcher: ${result.errorMessage}`,
-            },
-          ],
-        };
-      }
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Successfully added ${account_id} as watcher to ${ticket_key}`,
-          },
-        ],
-      };
-    }
-  );
-
-  // Remove watcher tool
-  server.tool(
-    "remove-watcher",
-    "Remove a watcher from a JIRA ticket",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      account_id: z.string().min(1, "Account ID is required"),
-    },
-    async ({ ticket_key, account_id }) => {
-      const auth = Buffer.from(
-        `${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`
-      ).toString("base64");
-
-      const result = await removeJiraWatcher(ticket_key, account_id, auth);
-
-      if (!result.success) {
-        return {
-          content: [{ type: "text" as const, text: `Error removing watcher: ${result.errorMessage}` }],
-        };
-      }
-
-      return {
-        content: [{ type: "text" as const, text: `Successfully removed ${account_id} as watcher from ${ticket_key}` }],
-      };
-    }
-  );
-
-  // Get issue history tool
-  server.tool(
-    "get-issue-history",
-    "Get the full change history (changelog) of a JIRA ticket",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      max_results: z.number().min(1).max(100).default(50).optional(),
-    },
-    async ({ ticket_key, max_results = 50 }) => {
-      const auth = Buffer.from(`${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`).toString("base64");
-      const result = await getJiraIssueHistory(ticket_key, auth);
-
-      if (!result.success) {
-        return { content: [{ type: "text" as const, text: `Error getting history: ${result.errorMessage}` }] };
-      }
-
-      const entries = (result.data?.values ?? []).slice(0, max_results).map((entry) => ({
-        id: entry.id,
-        author: entry.author.displayName,
-        created: entry.created,
-        changes: entry.items.map((item) => ({
-          field: item.field,
-          from: item.fromString,
-          to: item.toString,
-        })),
-      }));
-
-      if (entries.length === 0) {
-        return { content: [{ type: "text" as const, text: `No history found for ${ticket_key}` }] };
-      }
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: `History for ${ticket_key} (${entries.length} entries):\n\n${JSON.stringify(entries, null, 2)}`,
-        }],
-      };
-    }
-  );
-
-  // Add worklog tool
-  server.tool(
-    "add-worklog",
-    "Log time spent on a JIRA ticket (e.g. '2h 30m', '1d')",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-      time_spent: z.string().min(1, "Time spent is required (e.g. '2h 30m', '1d')"),
-      comment: z.string().optional().describe("Optional comment about the work done"),
-    },
-    async ({ ticket_key, time_spent, comment }) => {
-      const auth = Buffer.from(`${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`).toString("base64");
-      const commentBody = comment ? formatDescription(comment) : undefined;
-      const result = await addJiraWorklog(ticket_key, time_spent, commentBody, auth);
-
-      if (!result.success) {
-        return { content: [{ type: "text" as const, text: `Error adding worklog: ${result.errorMessage}` }] };
-      }
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Successfully logged ${time_spent} on ${ticket_key}${comment ? ` with comment: "${comment}"` : ""}`,
-        }],
-      };
-    }
-  );
-
-  // Get related issues tool
-  server.tool(
-    "get-related-issues",
-    "Get issues linked to a JIRA ticket (blocks, is blocked by, relates to, etc.)",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-    },
-    async ({ ticket_key }) => {
-      const auth = Buffer.from(`${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`).toString("base64");
-      const result = await getJiraRelatedIssues(ticket_key, auth);
-
-      if (!result.success) {
-        return { content: [{ type: "text" as const, text: `Error getting related issues: ${result.errorMessage}` }] };
-      }
-
-      const links = result.data ?? [];
-      if (links.length === 0) {
-        return { content: [{ type: "text" as const, text: `No linked issues found for ${ticket_key}` }] };
-      }
-
-      const formatted = links.map((link: any) => {
-        const related = link.outwardIssue ?? link.inwardIssue;
-        const direction = link.outwardIssue ? link.type?.outward : link.type?.inward;
-        return {
-          type: direction,
-          key: related?.key,
-          summary: related?.fields?.summary,
-          status: related?.fields?.status?.name,
-        };
-      });
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: `${links.length} linked issue(s) for ${ticket_key}:\n\n${JSON.stringify(formatted, null, 2)}`,
-        }],
-      };
-    }
-  );
-
-  // Get development info tool
-  server.tool(
-    "get-dev-info",
-    "Get development information (PRs, branches, commits) linked to a JIRA ticket via GitHub integration",
-    {
-      ticket_key: z.string().min(1, "Ticket key is required"),
-    },
-    async ({ ticket_key }) => {
-      const auth = Buffer.from(`${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`).toString("base64");
-
-      const idResult = await getJiraIssueId(ticket_key, auth);
-      if (!idResult.success || !idResult.id) {
-        return { content: [{ type: "text" as const, text: `Error resolving issue ID: ${idResult.errorMessage}` }] };
-      }
-
-      const result = await getJiraDevInfo(idResult.id, auth);
-      if (!result.success) {
-        return { content: [{ type: "text" as const, text: `Error getting dev info: ${result.errorMessage}` }] };
-      }
-
-      const detail = result.data?.detail?.[0] ?? {};
-      const summary = {
-        pullRequests: (detail.pullRequests ?? []).map((pr: any) => ({
-          title: pr.title,
-          status: pr.status,
-          url: pr.url,
-          repository: pr.repositoryName,
-        })),
-        branches: (detail.branches ?? []).map((b: any) => ({
-          name: b.name,
-          url: b.url,
-          repository: b.repositoryName,
-        })),
-        commits: (detail.commits ?? []).map((c: any) => ({
-          message: c.message,
-          author: c.author,
-          date: c.authorTimestamp,
-          url: c.url,
-          repository: c.repositoryName,
-        })),
-      };
-
-      const total = summary.pullRequests.length + summary.branches.length + summary.commits.length;
-      if (total === 0) {
-        return { content: [{ type: "text" as const, text: `No development information found for ${ticket_key}` }] };
-      }
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Development info for ${ticket_key}:\n\n${JSON.stringify(summary, null, 2)}`,
-        }],
-      };
-    }
-  );
-
-  // Get sprints tool
-  server.tool(
-    "get-sprints",
-    "List sprints for a JIRA board (active, future, or closed)",
-    {
-      board_id: z.number().int().positive("Board ID is required"),
-      state: z.enum(["active", "future", "closed"]).optional().describe("Filter by sprint state (default: active)"),
-    },
-    async ({ board_id, state = "active" }) => {
-      const auth = Buffer.from(`${process.env.JIRA_USERNAME}:${process.env.JIRA_API_TOKEN}`).toString("base64");
-      const result = await getJiraBoardSprints(board_id, state, auth);
-
-      if (!result.success) {
-        return { content: [{ type: "text" as const, text: `Error getting sprints: ${result.errorMessage}` }] };
-      }
-
-      const sprints = result.data?.values ?? [];
-      if (sprints.length === 0) {
-        return { content: [{ type: "text" as const, text: `No ${state} sprints found for board ${board_id}` }] };
-      }
-
-      const formatted = sprints.map((s) => ({
-        id: s.id,
-        name: s.name,
-        state: s.state,
-        startDate: s.startDate,
-        endDate: s.endDate,
-        goal: s.goal,
-      }));
-
-      return {
-        content: [{
-          type: "text" as const,
-          text: `${sprints.length} ${state} sprint(s) for board ${board_id}:\n\n${JSON.stringify(formatted, null, 2)}`,
-        }],
-      };
-    }
-  );
+    const failed = reports.some(({ state }) => state !== "done");
+    const heading = failed ? `Some test steps could not be added to ticket ${ticket_key}`
+      : `Successfully added ${steps.length} test step(s) to ticket ${ticket_key}`;
+    return batchResult(`${heading}:\n\n${results.join("\n")}`, { steps: reports }, failed);
+  });
 }
